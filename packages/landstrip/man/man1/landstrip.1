@@ -221,6 +221,11 @@ sockets are available under every network policy for routing and interface
 discovery.
 Kernel privilege checks continue to prevent unprivileged route-changing
 operations.
+System V semaphore operations are permitted for database locking such as LMDB.
+This allowance is subject to OS permissions, is not scoped to filesystem grants,
+and does not permit other System V IPC operations.
+Mach lookup of com.apple.FSEvents is permitted for filesystem watchers;
+filesystem read/write grants remain unchanged.
 .It Windows
 AppContainer or restricted local users enforce explicit filesystem grants.
 Restricted-user mode uses Windows Filtering Platform rules.

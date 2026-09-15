@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 pub mod fs;
+pub mod ipc;
 pub mod net;
 pub mod process;
 
@@ -21,6 +22,7 @@ pub fn dispatch(subcommand: &std::ffi::OsStr, mut args: std::env::ArgsOs) -> Opt
         "openat2" => Some(fs::openat2_probe(args.next(), args.next())),
         "fd-metadata" => Some(fs::fd_metadata_probe(args.next(), args.next())),
         "abstract-connect" => Some(net::abstract_connect_probe(args.next())),
+        "sysv-sem" => Some(ipc::sysv_sem_probe()),
         "route-socket" => Some(net::route_socket_probe()),
         "udp-bind" => Some(net::udp_bind_probe()),
         "udp-local" => Some(net::udp_local_probe()),
