@@ -110,6 +110,7 @@ fn render_profile(
 
     render_process_rules(&mut sb)?;
     render_mach_rules(&mut sb)?;
+    writeln!(sb, "(allow ipc-sysv-sem)")?;
     render_terminal_rules(&mut sb, terminals)?;
     render_write_rules(
         &mut sb,
@@ -157,6 +158,7 @@ fn render_mach_rules(sb: &mut String) -> fmt::Result {
         sb,
         "  (global-name \"com.apple.distributed_notifications@Uv3\")"
     )?;
+    writeln!(sb, "  (global-name \"com.apple.FSEvents\")")?;
     writeln!(sb, "  (global-name \"com.apple.FontObjectsServer\")")?;
     writeln!(sb, "  (global-name \"com.apple.fonts\")")?;
     writeln!(sb, "  (global-name \"com.apple.logd\")")?;

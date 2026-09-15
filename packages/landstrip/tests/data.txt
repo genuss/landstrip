@@ -101,6 +101,8 @@ name=mkdir -p preserves EEXIST for an existing denied file | os=linux | setup=wr
 name=mkdir -p preserves EEXIST for a denied dangling symlink | os=linux | setup=symlink:missing:existing-link | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'mkdir -p "$1"' _ %TMP%/existing-link | status=!0 | out!="kind":"filesystem"
 name=denyWrite preserves ENOENT for a missing parent | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"],"denyWrite":["%TMP%/allowed/.env"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'LC_ALL=C; error=$(mkdir "$1/missing/leaf" 2>&1) && exit 1; case "$error" in *"No such file or directory"*) ;; *) printf "%s\n" "$error"; exit 1;; esac; mkdir "$1/missing" && mkdir "$1/missing/leaf"' _ %TMP%/allowed | status=0
 
+name=System V semaphores support database locking | os=macos | ipc=sysv-sem | policy={} | status=0 | out=semaphore round-trip ok
+
 name=terminal stdin permits raw mode and restoration | os=macos | terminal=0 | policy={"filesystem":{"allowWrite":["/dev"]}} | status=0
 name=terminal stdout permits raw mode and restoration | os=macos | terminal=1 | policy={"filesystem":{"allowWrite":["/dev"]}} | status=0
 name=terminal stderr permits raw mode and restoration | os=macos | terminal=2 | policy={"filesystem":{"allowWrite":["/dev"]}} | status=0

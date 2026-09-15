@@ -33,6 +33,7 @@ const SIGNAL_OUTSIDE_PROBE_ARG: &str = "--test-signal-outside";
 const SIGNAL_THREAD_PROBE_ARG: &str = "--test-signal-thread";
 const IO_URING_PROBE_ARG: &str = "--test-io-uring";
 const DAEMON_PROBE_ARG: &str = "--test-daemon";
+const SYSV_SEM_PROBE_ARG: &str = "--test-sysv-sem";
 
 fn main() {
     let mut args = std::env::args_os();
@@ -73,6 +74,9 @@ fn main() {
         }
         Some(value) if value == std::ffi::OsStr::new(DAEMON_PROBE_ARG) => {
             std::process::exit(daemon_probe(args.next()));
+        }
+        Some(value) if value == std::ffi::OsStr::new(SYSV_SEM_PROBE_ARG) => {
+            std::process::exit(sysv_sem_probe());
         }
         _ => {}
     }
@@ -266,6 +270,7 @@ struct Case {
     net: Option<Net>,
     fs: Option<Fs>,
     terminal: Option<i32>,
+    sysv_sem: bool,
     unixsock: Option<String>,
     status: Status,
     checks: Vec<Check>,
@@ -292,6 +297,7 @@ impl Case {
             net: None,
             fs: None,
             terminal: None,
+            sysv_sem: false,
             unixsock: None,
             status: Status::Zero,
             checks: Vec::new(),
@@ -326,6 +332,10 @@ impl Case {
                     let fd = value.parse().expect("terminal must be a descriptor or -1");
                     assert!((-1..=3).contains(&fd), "terminal must be -1, 0, 1, 2 or 3");
                     case.terminal = Some(fd);
+                }
+                "ipc" => {
+                    assert_eq!(value, "sysv-sem", "unknown IPC probe");
+                    case.sysv_sem = true;
                 }
                 "unixsock" => case.unixsock = Some(value.to_owned()),
                 "status" => case.status = parse_status(value),
@@ -531,6 +541,11 @@ impl Case {
             }
             #[cfg(not(target_os = "macos"))]
             return Err(format!("terminal fd {fd} requires macOS"));
+        }
+        if self.sysv_sem {
+            command
+                .arg(std::env::current_exe().map_err(|error| format!("current exe: {error}"))?)
+                .arg(SYSV_SEM_PROBE_ARG);
         }
         if let Some(cmd) = &self.cmd {
             for token in tokenize(cmd) {
@@ -1336,6 +1351,65 @@ fn openat2_probe(path: Option<std::ffi::OsString>, operation: Option<std::ffi::O
 
 #[cfg(not(target_os = "linux"))]
 fn openat2_probe(_path: Option<std::ffi::OsString>, _operation: Option<std::ffi::OsString>) -> i32 {
+    2
+}
+
+#[cfg(target_os = "macos")]
+fn sysv_sem_probe() -> i32 {
+    struct Semaphore(libc::c_int);
+
+    impl Drop for Semaphore {
+        fn drop(&mut self) {
+            unsafe { libc::semctl(self.0, 0, libc::IPC_RMID) };
+        }
+    }
+
+    let result = (|| -> std::io::Result<()> {
+        let id = unsafe { libc::semget(libc::IPC_PRIVATE, 1, libc::IPC_CREAT | 0o600) };
+        if id == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let sem = Semaphore(id);
+        if unsafe { libc::semctl(sem.0, 0, libc::SETVAL, 1 as libc::c_int) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        for (operation, expected) in [(-1, 0), (1, 1)] {
+            let mut op = libc::sembuf {
+                sem_num: 0,
+                sem_op: operation,
+                sem_flg: (libc::SEM_UNDO | libc::IPC_NOWAIT) as libc::c_short,
+            };
+            if unsafe { libc::semop(sem.0, &raw mut op, 1) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let value = unsafe { libc::semctl(sem.0, 0, libc::GETVAL) };
+            if value == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if value != expected {
+                return Err(std::io::Error::other("unexpected semaphore value"));
+            }
+        }
+        if unsafe { libc::semctl(sem.0, 0, libc::IPC_RMID) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        std::mem::forget(sem);
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            println!("semaphore round-trip ok");
+            0
+        }
+        Err(error) => {
+            eprintln!("System V semaphore probe: {error}");
+            1
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sysv_sem_probe() -> i32 {
     2
 }
 
