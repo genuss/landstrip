@@ -91,6 +91,11 @@ Inherited descriptors grant access to their resources outside pathname and
 network policy.
 All other descriptors except standard input, output, and error are closed
 before sandbox exec.
+On macOS, terminal devices attached to standard input, output, error, or
+.Fl -inherit
+receive a pathname-scoped ioctl allowance for terminal mode changes.
+This does not grant file read/write access or ioctls on other devices, and does
+not enable allocation of new PTYs.
 .El
 .Ss Windows installation
 These options apply to

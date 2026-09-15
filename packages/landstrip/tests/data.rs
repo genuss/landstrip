@@ -18,6 +18,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+mod terminal;
+
 const DATA: &str = include_str!("data.txt");
 
 mod probe;
@@ -193,6 +196,7 @@ struct Case {
     cwd: Option<String>,
     cmd: Option<String>,
     net: Option<Net>,
+    terminal: Option<i32>,
     unixsock: Option<String>,
     status: Status,
     timeout_secs: Option<u64>,
@@ -218,6 +222,7 @@ impl Case {
             cwd: None,
             cmd: None,
             net: None,
+            terminal: None,
             unixsock: None,
             status: Status::Zero,
             timeout_secs: None,
@@ -248,6 +253,11 @@ impl Case {
                 "cwd" => case.cwd = Some(value.to_owned()),
                 "cmd" => case.cmd = Some(value.to_owned()),
                 "net" => case.net = Some(parse_net(value)),
+                "terminal" => {
+                    let fd = value.parse().expect("terminal must be a descriptor or -1");
+                    assert!((-1..=3).contains(&fd), "terminal must be -1, 0, 1, 2 or 3");
+                    case.terminal = Some(fd);
+                }
                 "unixsock" => case.unixsock = Some(value.to_owned()),
                 "status" => case.status = parse_status(value),
                 "timeout_secs" => {
@@ -442,6 +452,17 @@ impl Case {
             }
         }
         command.arg("--");
+        if let Some(fd) = self.terminal {
+            #[cfg(target_os = "macos")]
+            {
+                let output = terminal::run(command, fd, &dir.join("denied/terminal-write"))?;
+                let merged = merge(&output.stdout, &output.stderr);
+                self.check_status(output.status.code().unwrap_or(-1), &merged)?;
+                return self.check_output(&merged, None);
+            }
+            #[cfg(not(target_os = "macos"))]
+            return Err(format!("terminal fd {fd} requires macOS"));
+        }
         if let Some(cmd) = &self.cmd {
             for token in tokenize(cmd) {
                 command.arg(resolver.subst(&token));

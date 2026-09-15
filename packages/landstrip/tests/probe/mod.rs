@@ -12,6 +12,8 @@ pub mod process;
 pub fn dispatch(subcommand: &std::ffi::OsStr, mut args: std::env::ArgsOs) -> Option<i32> {
     let sub = subcommand.to_str()?;
     match sub {
+        #[cfg(target_os = "macos")]
+        super::terminal::PROBE_ARG => Some(super::terminal::probe(args.collect())),
         "opath" => Some(fs::opath_probe(args.next())),
         "futimens" => Some(fs::futimens_probe(args.next())),
         "truncate" => Some(fs::truncate_probe(args.next())),
