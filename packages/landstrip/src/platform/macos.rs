@@ -11,7 +11,7 @@ use anyhow::Result;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::{self, Write};
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -27,7 +27,8 @@ pub(crate) fn execute(
     trap_fd: Option<&TrapFd>,
     inherited_fds: &[std::os::fd::RawFd],
 ) -> Result<i32> {
-    let profile = render_profile(policy).map_err(seatbelt_error)?;
+    let terminals = inherited_terminal_paths(inherited_fds).map_err(seatbelt_error)?;
+    let profile = render_profile(policy, &terminals).map_err(seatbelt_error)?;
     apply_profile(&profile)?;
     close_inherited_fds(trap_fd.map(AsRawFd::as_raw_fd).as_slice(), inherited_fds)
         .map_err(seatbelt_error)?;
@@ -68,13 +69,48 @@ fn apply_profile(profile: &str) -> Result<()> {
     }
 }
 
-fn render_profile(policy: &AccessPolicy) -> std::result::Result<String, fmt::Error> {
+fn inherited_terminal_paths(inherited_fds: &[RawFd]) -> io::Result<Vec<String>> {
+    let mut terminals = Vec::new();
+    for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
+        .into_iter()
+        .chain(inherited_fds.iter().copied())
+    {
+        if let Some(path) = terminal_path(fd)? {
+            terminals.push(path);
+        }
+    }
+    terminals.sort_unstable();
+    terminals.dedup();
+    Ok(terminals)
+}
+
+fn terminal_path(fd: RawFd) -> io::Result<Option<String>> {
+    let mut buffer = [0; libc::PATH_MAX as usize];
+    let rc = unsafe { libc::ttyname_r(fd, buffer.as_mut_ptr(), buffer.len()) };
+    match rc {
+        0 => {
+            let path = unsafe { CStr::from_ptr(buffer.as_ptr()) };
+            let path = path
+                .to_str()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            Ok(Some(path.to_owned()))
+        }
+        libc::ENOTTY | libc::EBADF => Ok(None),
+        errno => Err(io::Error::from_raw_os_error(errno)),
+    }
+}
+
+fn render_profile(
+    policy: &AccessPolicy,
+    terminals: &[String],
+) -> std::result::Result<String, fmt::Error> {
     let mut sb = String::new();
     writeln!(sb, "(version 1)")?;
     writeln!(sb, "(deny default)")?;
 
     render_process_rules(&mut sb)?;
     render_mach_rules(&mut sb)?;
+    render_terminal_rules(&mut sb, terminals)?;
     render_write_rules(
         &mut sb,
         &policy.write_roots,
@@ -147,6 +183,14 @@ fn render_mach_rules(sb: &mut String) -> fmt::Result {
         sb,
         "(allow system-socket (require-all (socket-domain AF_SYSTEM) (socket-protocol 2)))"
     )
+}
+
+fn render_terminal_rules(sb: &mut String, terminals: &[String]) -> fmt::Result {
+    for terminal in terminals {
+        let escaped = escape_sbpl_literal(terminal);
+        writeln!(sb, "(allow file-ioctl (literal \"{escaped}\"))")?;
+    }
+    Ok(())
 }
 
 fn glob_to_sbpl_regex(pattern: &str) -> String {

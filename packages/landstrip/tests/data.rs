@@ -16,6 +16,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+mod terminal;
+
 const DATA: &str = include_str!("data.txt");
 
 /// Re-exec argument marker for `fs=opath` probes (see [`opath_probe`]).
@@ -34,6 +37,10 @@ const DAEMON_PROBE_ARG: &str = "--test-daemon";
 fn main() {
     let mut args = std::env::args_os();
     match args.nth(1).as_deref() {
+        #[cfg(target_os = "macos")]
+        Some(value) if value == std::ffi::OsStr::new(terminal::PROBE_ARG) => {
+            std::process::exit(terminal::probe(args.collect()));
+        }
         Some(value) if value == std::ffi::OsStr::new(OPATH_PROBE_ARG) => {
             std::process::exit(opath_probe(args.next()));
         }
@@ -258,6 +265,7 @@ struct Case {
     cmd: Option<String>,
     net: Option<Net>,
     fs: Option<Fs>,
+    terminal: Option<i32>,
     unixsock: Option<String>,
     status: Status,
     checks: Vec<Check>,
@@ -283,6 +291,7 @@ impl Case {
             cmd: None,
             net: None,
             fs: None,
+            terminal: None,
             unixsock: None,
             status: Status::Zero,
             checks: Vec::new(),
@@ -313,6 +322,11 @@ impl Case {
                 "cmd" => case.cmd = Some(value.to_owned()),
                 "net" => case.net = Some(parse_net(value)),
                 "fs" => case.fs = Some(parse_fs(value)),
+                "terminal" => {
+                    let fd = value.parse().expect("terminal must be a descriptor or -1");
+                    assert!((-1..=3).contains(&fd), "terminal must be -1, 0, 1, 2 or 3");
+                    case.terminal = Some(fd);
+                }
                 "unixsock" => case.unixsock = Some(value.to_owned()),
                 "status" => case.status = parse_status(value),
                 "out" | "out!" | "trapfd" | "trapfd!" => {
@@ -507,6 +521,17 @@ impl Case {
             }
         }
         command.arg("--");
+        if let Some(fd) = self.terminal {
+            #[cfg(target_os = "macos")]
+            {
+                let output = terminal::run(command, fd, &dir.join("denied/terminal-write"))?;
+                let merged = merge(&output.stdout, &output.stderr);
+                self.check_status(output.status.code().unwrap_or(-1), &merged)?;
+                return self.check_output(&merged, None);
+            }
+            #[cfg(not(target_os = "macos"))]
+            return Err(format!("terminal fd {fd} requires macOS"));
+        }
         if let Some(cmd) = &self.cmd {
             for token in tokenize(cmd) {
                 command.arg(resolver.subst(&token));
