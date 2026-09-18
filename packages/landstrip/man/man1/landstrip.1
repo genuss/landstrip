@@ -213,6 +213,8 @@ This allowance is subject to OS permissions, is not scoped to filesystem grants,
 and does not permit other System V IPC operations.
 Mach lookup of com.apple.FSEvents is permitted for filesystem watchers;
 filesystem read/write grants remain unchanged.
+Mach lookup of com.apple.pasteboard.1 permits native clipboard access for the
+sandboxed process and its children, not only in response to a user paste action.
 .It Windows
 AppContainer or restricted local users enforce explicit filesystem grants.
 Restricted-user mode uses Windows Filtering Platform rules.

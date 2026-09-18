@@ -163,6 +163,7 @@ fn render_mach_rules(sb: &mut String) -> fmt::Result {
     writeln!(sb, "  (global-name \"com.apple.fonts\")")?;
     writeln!(sb, "  (global-name \"com.apple.logd\")")?;
     writeln!(sb, "  (global-name \"com.apple.lsd.mapdb\")")?;
+    writeln!(sb, "  (global-name \"com.apple.pasteboard.1\")")?;
     writeln!(sb, "  (global-name \"com.apple.PowerManagement.control\")")?;
     writeln!(sb, "  (global-name \"com.apple.securityd.xpc\")")?;
     // apple/container CLI talks to its daemons over XPC.
