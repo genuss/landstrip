@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # Copyright (C) Jarkko Sakkinen 2026
 #
-# Pack locally and stage a draft release; npm publication is a separate manual
-# GitHub Actions step. Run `make package` first, then push the signed tag yourself.
+# Pack locally, stage a draft release, then dispatch npm provenance publishing.
+# Run `make package` first, then push the signed tag yourself.
 
 set -euo pipefail
 
@@ -276,6 +276,9 @@ fi
 remote_commit="$(git ls-remote origin "refs/tags/$version^{}" | awk '{print $1}')"
 [[ -n "$remote_commit" && "$remote_commit" == "$tag_commit" ]] \
   || die "push the signed tag $version to origin before staging the release"
+remote_main="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
+[[ "$remote_main" == "$tag_commit" ]] \
+  || die "push the release commit to origin/main before staging the release"
 cargo_root="$repo_root"
 printf 'staging tag %s (%s)\n' "$version" "${tag_commit:0:12}"
 
@@ -338,7 +341,8 @@ scripts/publish-npm-provenance.sh preflight "$version" "$workdir/release"
 
 publish_cargo_package "$cargo_root/packages/landstrip"
 stage_github_release
-printf 'staged landstrip %s; npm tarballs were built locally\n' "$version"
-printf 'configure npm trusted publisher for each package: landstrip/landstrip, publish-npm.yml\n'
-printf 'run: gh workflow run publish-npm.yml --ref main -f version=%s\n' "$version"
+if ! github_retry "$GH" workflow run publish-npm.yml --ref main -f "version=$version"; then
+  die "release staged; retry: gh workflow run publish-npm.yml --ref main -f version=$version"
+fi
+printf 'staged landstrip %s and dispatched npm publish workflow\n' "$version"
 printf 'after it succeeds, run: make publish-finish VERSION=%s\n' "$version"
