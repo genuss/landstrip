@@ -29,7 +29,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-          registry-url: https://registry.npmjs.org
       - name: Install npm with OIDC trusted publishing support
         run: npm install -g npm@11
       - name: Download locally packed release assets
