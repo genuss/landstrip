@@ -340,5 +340,5 @@ publish_cargo_package "$cargo_root/packages/landstrip"
 stage_github_release
 printf 'staged landstrip %s; npm tarballs were built locally\n' "$version"
 printf 'configure npm trusted publisher for each package: landstrip/landstrip, publish-npm.yml\n'
-printf 'run: gh workflow run publish-npm.yml --ref %s -f version=%s\n' "$version" "$version"
+printf 'run: gh workflow run publish-npm.yml --ref main -f version=%s\n' "$version"
 printf 'after it succeeds, run: make publish-finish VERSION=%s\n' "$version"
