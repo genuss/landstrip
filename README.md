@@ -63,7 +63,10 @@ packages must be public. Once the workflow is on the default branch, manually
 run the command printed by `make publish` (select the release tag as its ref).
 GitHub only downloads, verifies, and publishes the already-packed tarballs with
 OIDC and npm provenance; it does not rebuild them. Provenance attests to this
-hosted publish step and its tag, not to the local build environment. After the
+hosted publish step and its tag, not to the local build environment. The
+workflow needs `contents: write` solely because GitHub does not expose *draft*
+release assets to read-only workflow tokens; it makes no repository changes.
+This permission is broader than the work the workflow performs. After the
 workflow succeeds, run `make publish-finish VERSION=VERSION` locally. This
 checks the published tarball integrity and provenance before making the draft
 release public and committing updated npm integrity lockfile entries. Push
