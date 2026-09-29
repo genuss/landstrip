@@ -10,6 +10,8 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
@@ -193,6 +195,7 @@ struct Case {
     net: Option<Net>,
     unixsock: Option<String>,
     status: Status,
+    timeout_secs: Option<u64>,
     checks: Vec<Check>,
     trapfd_empty: bool,
 }
@@ -217,6 +220,7 @@ impl Case {
             net: None,
             unixsock: None,
             status: Status::Zero,
+            timeout_secs: None,
             checks: Vec::new(),
             trapfd_empty: false,
         };
@@ -246,6 +250,9 @@ impl Case {
                 "net" => case.net = Some(parse_net(value)),
                 "unixsock" => case.unixsock = Some(value.to_owned()),
                 "status" => case.status = parse_status(value),
+                "timeout_secs" => {
+                    case.timeout_secs = Some(value.parse().expect("timeout_secs=u64"))
+                }
                 "out" | "out!" | "trapfd" | "trapfd!" => {
                     let channel = if key.starts_with("trapfd") {
                         Channel::TrapFd
@@ -457,6 +464,10 @@ impl Case {
         } else {
             Stdio::null()
         });
+        #[cfg(target_os = "linux")]
+        if self.timeout_secs.is_some() {
+            command.process_group(0);
+        }
 
         let mut child = command
             .spawn()
@@ -471,6 +482,36 @@ impl Case {
                 .unwrap()
                 .write_all(body.as_bytes())
                 .map_err(|e| format!("write stdin policy: {e}"))?;
+        }
+        if let Some(seconds) = self.timeout_secs {
+            let deadline = Instant::now() + Duration::from_secs(seconds);
+            loop {
+                if child
+                    .try_wait()
+                    .map_err(|e| format!("poll landstrip: {e}"))?
+                    .is_some()
+                {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let pid = i32::try_from(child.id())
+                            .map_err(|e| format!("invalid landstrip pid: {e}"))?;
+                        // SAFETY: this child started a separate process group at spawn.
+                        if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0
+                            && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+                        {
+                            child.kill().map_err(|e| format!("kill landstrip: {e}"))?;
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    child.kill().map_err(|e| format!("kill landstrip: {e}"))?;
+                    child.wait().map_err(|e| format!("reap landstrip: {e}"))?;
+                    return Err(format!("landstrip exceeded {seconds}s timeout"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
         let output = child
             .wait_with_output()

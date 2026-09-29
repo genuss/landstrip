@@ -28,7 +28,6 @@ use crate::trap::{FilesystemDenial, NetworkOperation, ProcessContext, Trap, Trap
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
 use nix::errno::Errno;
-use nix::fcntl::{FcntlArg, fcntl};
 use nix::poll::{PollFd, PollFlags, poll};
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 use nix::sys::uio::{RemoteIoVec, process_vm_readv};
@@ -245,6 +244,7 @@ pub(super) fn run_broker(
     let syscalls = NotificationSyscalls::new();
     let restricted = !policy.network_access.is_unrestricted();
     let allow_local_binding = policy.network_access.allows_local_binding();
+    let handoff_by_pidfd = restricted && allow_local_binding;
     let errno = build_errno_filter(&syscalls, restricted, allow_local_binding, unix_sockets)?;
     let io_uring = Some(build_io_uring_deny(&syscalls)?);
 
@@ -305,13 +305,11 @@ pub(super) fn run_broker(
 
                 {
                     let notify = load_filters(errno.as_ref(), io_uring.as_ref(), notify.as_ref())?;
-
-                    let notify = fcntl(notify.as_fd(), FcntlArg::F_DUPFD_CLOEXEC(0))
-                        .map_err(supervise_errno)?;
-                    // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
-                    let notify = unsafe { OwnedFd::from_raw_fd(notify) };
-
-                    send_fd(&child_sock, notify.as_fd())?;
+                    if handoff_by_pidfd {
+                        send_listener(&mut child_sock, notify.as_fd())?;
+                    } else {
+                        send_fd(&child_sock, notify.as_fd())?;
+                    }
                     handed_off = true;
                 }
 
@@ -348,7 +346,7 @@ pub(super) fn run_broker(
         }
         ForkResult::Parent { child } => {
             drop(child_sock);
-            let (result, notify) = match get_notify_fd(&parent) {
+            let (result, notify) = match get_notify_fd(&parent, child, handoff_by_pidfd) {
                 Ok(NotifyStartup::Ready(notify)) => {
                     let result = supervise_child(
                         policy,
@@ -3328,11 +3326,24 @@ fn send_fd(socket: &UnixStream, fd: BorrowedFd<'_>) -> Result<()> {
             None,
         ) {
             Ok(_) => return Ok(()),
-            // A signal during the fd transfer must not abort the broker setup.
             Err(Errno::EINTR) => {}
             Err(error) => return Err(supervise_errno(error).into()),
         }
     }
+}
+fn send_listener(socket: &mut UnixStream, fd: BorrowedFd<'_>) -> Result<()> {
+    socket
+        .write_all(&[0_u8])
+        .and_then(|()| socket.write_all(&fd.as_raw_fd().to_ne_bytes()))
+        .map_err(LandstripError::supervise)?;
+    let mut ack = [0_u8];
+    socket
+        .read_exact(&mut ack)
+        .map_err(LandstripError::supervise)?;
+    if ack != [0] {
+        return Err(LandstripError::supervise("notify: invalid acknowledgment").into());
+    }
+    Ok(())
 }
 
 fn send_trap(socket: &mut UnixStream, trap: &Trap) -> Result<()> {
@@ -3352,11 +3363,11 @@ fn send_trap(socket: &mut UnixStream, trap: &Trap) -> Result<()> {
     Ok(())
 }
 
-fn get_notify_fd(socket: &UnixStream) -> Result<NotifyStartup> {
-    let mut byte = [0_u8];
-    let mut iov = [IoSliceMut::new(&mut byte)];
+fn get_notify_fd(socket: &UnixStream, child: Pid, handoff_by_pidfd: bool) -> Result<NotifyStartup> {
+    let mut marker = [0_u8];
+    let mut iov = [IoSliceMut::new(&mut marker)];
     let mut control = nix::cmsg_space!([RawFd; 1]);
-    let (bytes, fd) = loop {
+    let fd = loop {
         let message = match recvmsg::<()>(
             socket.as_raw_fd(),
             &mut iov,
@@ -3374,14 +3385,28 @@ fn get_notify_fd(socket: &UnixStream) -> Result<NotifyStartup> {
                 ControlMessageOwned::ScmRights(fds) => fds.first().copied(),
                 _ => None,
             });
-        break (message.bytes, fd);
+        if message.bytes == 0 {
+            return Err(LandstripError::supervise("notify: unexpected eof").into());
+        }
+        break fd;
     };
 
-    if bytes == 0 {
-        return Err(LandstripError::supervise("notify: unexpected eof").into());
-    }
-
-    match byte[0] {
+    let mut socket = socket;
+    match marker[0] {
+        0 if handoff_by_pidfd => {
+            let mut number = [0_u8; mem::size_of::<RawFd>()];
+            socket
+                .read_exact(&mut number)
+                .map_err(LandstripError::supervise)?;
+            let fd = RawFd::from_ne_bytes(number);
+            let notify = duplicate_target_fd(child, fd).map_err(|error| {
+                LandstripError::supervise(io::Error::from_raw_os_error(error.errno()))
+            })?;
+            socket
+                .write_all(&[0_u8])
+                .map_err(LandstripError::supervise)?;
+            Ok(NotifyStartup::Ready(notify))
+        }
         0 => fd.map_or_else(
             || Err(LandstripError::supervise("notify: missing descriptor").into()),
             |fd| {
