@@ -260,4 +260,4 @@ printf '\n%s\n' "$sob" >>"$release_notes"
 git tag -s "$next_ver" -F "$release_notes"
 
 printf 'tagged %s\n' "$next_ver"
-printf 'push the commit and tag, then run: make ci && PACKAGE_STRICT=1 make package && make publish\n'
+printf 'push the commit and tag, check out the tag commit, then run: make ci && PACKAGE_STRICT=1 make package && make publish\n'

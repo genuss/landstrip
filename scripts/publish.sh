@@ -2,11 +2,8 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # Copyright (C) Jarkko Sakkinen 2026
 #
-# Publish crates.io + npm packages from locally packaged binaries.
-# Run `make package` (or PACKAGE_STRICT=1 make package) first.
-#
-# Defaults to the highest semver tag reachable from HEAD.
-# Tip may be ahead of the tag; cargo is published from the tagged tree.
+# Pack locally and stage a draft release; npm publication is a separate manual
+# GitHub Actions step. Run `make package` first, then push the signed tag yourself.
 
 set -euo pipefail
 
@@ -33,12 +30,6 @@ platforms=(
 cleanup() {
   local status=$?
 
-  if [[ -n "${publish_worktree:-}" ]]; then
-    if ! git -C "${repo_root:-.}" worktree remove --force "$publish_worktree" 2>/dev/null; then
-      rm -rf "$publish_worktree"
-      git -C "${repo_root:-.}" worktree prune >/dev/null 2>&1 || true
-    fi
-  fi
   if [[ -n "${workdir:-}" ]]; then
     rm -rf "$workdir"
   fi
@@ -54,23 +45,6 @@ die() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
-}
-
-npm_package_exists() {
-  local error_file="$workdir/npm-view-error"
-  local package_name="$1"
-  local package_version
-
-  if package_version="$($NPM view "$package_name@$version" version 2>"$error_file")"; then
-    [[ "$package_version" == "$version" ]] \
-      || die "npm returned version $package_version for $package_name@$version"
-    return 0
-  fi
-  if grep -q 'E404' "$error_file"; then
-    return 1
-  fi
-  cat "$error_file" >&2
-  die "cannot query $package_name@$version from npm"
 }
 
 # Packages with prepack (bun builds) need local node_modules for lifecycle
@@ -100,62 +74,22 @@ prepare_npm_package_build() {
   fi
 }
 
-publish_npm_package() {
+pack_npm_package() {
   local package_dir="$1"
-  local error_file="$workdir/npm-publish-error"
-  local package_name
+  local package_name package_version archive
 
   package_name="$($NODE -p "require('$package_dir/package.json').name")"
-  if npm_package_exists "$package_name"; then
-    printf '%s\n' "$package_name@$version is already published"
-    return
-  fi
-  prepare_npm_package_build "$package_dir"
-  if $NPM publish "$package_dir" --access public 2>"$error_file"; then
-    cat "$error_file" >&2
-    return
-  fi
-  cat "$error_file" >&2
-  if grep -q 'E409' "$error_file" \
-    && grep -q 'Cannot publish over previously staged version' "$error_file"; then
-    wait_for_npm_package "$package_name"
-    return
-  fi
-  return 1
-}
-
-preflight_npm_package() {
-  local package_dir="$1"
-  local package_name
-  local package_private
-  local package_version
-
-  package_name="$($NODE -p "require('$package_dir/package.json').name")"
-  package_private="$($NODE -p "require('$package_dir/package.json').private === true")"
   package_version="$($NODE -p "require('$package_dir/package.json').version")"
-  [[ "$package_private" != true ]] || die "$package_name is marked private"
+  [[ "$($NODE -p "require('$package_dir/package.json').private === true")" != true ]] \
+    || die "$package_name is marked private"
   [[ "$package_version" == "$version" ]] \
     || die "$package_name version $package_version does not match $version"
-  if npm_package_exists "$package_name"; then
-    printf '%s\n' "$package_name@$version is already published"
-    return
-  fi
   prepare_npm_package_build "$package_dir"
-  $NPM publish "$package_dir" --access public --dry-run --loglevel=error >/dev/null
-}
-
-wait_for_npm_package() {
-  local package_name="$1"
-  local attempt
-
-  printf '%s\n' "waiting for $package_name@$version to become available from npm"
-  for attempt in {1..60}; do
-    if npm_package_exists "$package_name"; then
-      return
-    fi
-    sleep 10
-  done
-  die "$package_name@$version did not become available from npm"
+  archive="$(cd "$package_dir" && $NPM pack --pack-destination "$workdir/release" --silent)"
+  archive="${archive##*$'\n'}"
+  [[ "$archive" == *.tgz && "$archive" != */* && -f "$workdir/release/$archive" ]] \
+    || die "npm pack did not create one tarball for $package_name"
+  write_sha256_sidecar "$workdir/release/$archive"
 }
 
 publish_cargo_package() {
@@ -215,39 +149,41 @@ github_release_exists() {
   done
 }
 
-publish_github_release() {
-  local asset name
+stage_github_release() {
+  local asset name downloaded
   local missing=()
+  local assets=("$workdir"/release/*.tar.gz "$workdir"/release/*.sha256 "$workdir"/release/*.tgz)
 
   if github_release_exists; then
-    for asset in "$workdir"/release/*.tar.gz "$workdir"/release/*.sha256; do
+    $NODE -e '
+      const release = require(process.argv[1]);
+      if (!release.draft || release.tag_name !== process.argv[2]) process.exit(1);
+    ' "$workdir/gh-release.json" "$version" \
+      || die "release $version exists but is not a draft for this tag"
+    for asset in "${assets[@]}"; do
       name="${asset##*/}"
       if $NODE -e '
-        const fs = require("fs");
-        const release = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-        const name = process.argv[2];
-        const assets = Array.isArray(release.assets) ? release.assets : [];
-        process.exit(assets.some((asset) => asset.name === name) ? 0 : 1);
+        const release = require(process.argv[1]);
+        process.exit(release.assets.some(asset => asset.name === process.argv[2]) ? 0 : 1);
       ' "$workdir/gh-release.json" "$name"; then
-        printf '%s\n' "GitHub release $version already has $name"
+        mkdir -p "$workdir/existing"
+        github_retry "$GH" release download "$version" --pattern "$name" --dir "$workdir/existing"
+        downloaded="$workdir/existing/$name"
+        if [[ ! -f "$downloaded" ]] || ! cmp -s "$asset" "$downloaded"; then
+          die "existing release asset differs: $name"
+        fi
       else
         missing+=("$asset")
       fi
     done
-    if ((${#missing[@]} == 0)); then
-      printf '%s\n' "GitHub release $version is already published"
-      return
+    if ((${#missing[@]} > 0)); then
+      github_retry "$GH" release upload "$version" "${missing[@]}"
     fi
-    github_retry "$GH" release upload "$version" "${missing[@]}"
     return
   fi
 
-  github_retry "$GH" release create "$version" \
-    "$workdir"/release/*.tar.gz \
-    "$workdir"/release/*.sha256 \
-    --notes-from-tag \
-    --title "landstrip $version" \
-    --verify-tag
+  github_retry "$GH" release create "$version" "${assets[@]}" \
+    --draft --notes-from-tag --title "landstrip $version" --verify-tag
 }
 
 platform_binary() {
@@ -293,7 +229,7 @@ if [[ -z "$version" ]]; then
 fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid version: $version"
 
-# npm packages are assembled from the tip tree; keep tip metadata on the tag.
+# Provenance refers to the tagged source: never package a newer tip tree.
 tip_version="$($NODE -p 'require("./packages/landstrip-api/package.json").version')"
 [[ "$version" == "$tip_version" ]] \
   || die "tag $version does not match tip package.json $tip_version"
@@ -305,6 +241,12 @@ if ! git merge-base --is-ancestor "$tag_commit" "$head_commit"; then
   die "tag $version is not an ancestor of HEAD"
 fi
 
+mode="${PUBLISH_MODE:-stage}"
+[[ "$mode" == stage || "$mode" == finish ]] || die "invalid PUBLISH_MODE: $mode"
+if [[ "$mode" == stage && "$tag_commit" != "$head_commit" ]]; then
+  die "checkout the exact tag commit before staging npm provenance"
+fi
+
 if [[ "$tag_commit" != "$head_commit" ]] \
   && ! git diff --quiet "$tag_commit" "$head_commit" -- \
     packages/landstrip/Cargo.toml packages/landstrip/Cargo.lock \
@@ -314,20 +256,28 @@ fi
 
 workdir="$(mktemp -d)"
 mkdir -p "$workdir/packages" "$workdir/release"
-publish_worktree=
-cargo_root="$repo_root"
-if [[ "$tag_commit" != "$head_commit" ]]; then
-  printf 'publishing tag %s (%s); HEAD is %s — cargo from tagged worktree\n' \
-    "$version" "${tag_commit:0:12}" "${head_commit:0:12}"
-  publish_worktree="$workdir/source"
-  git worktree add --detach "$publish_worktree" "$tag_commit" \
-    || die "cannot create worktree for tag $version"
-  [[ -f "$publish_worktree/packages/landstrip/Cargo.toml" ]] \
-    || die "worktree missing Cargo.toml: $publish_worktree"
-  cargo_root="$publish_worktree"
-else
-  printf 'publishing tag %s (matches HEAD)\n' "$version"
+if [[ "$mode" == finish ]]; then
+  github_release_exists || die "no staged GitHub release for $version"
+  $NODE -e 'const r = require(process.argv[1]); process.exit(r.draft ? 0 : 1)' \
+    "$workdir/gh-release.json" || die "release $version is not a draft"
+  github_retry "$GH" release download "$version" --pattern '*.tgz' \
+    --pattern '*.tgz.sha256' --dir "$workdir/release"
+  scripts/publish-npm-provenance.sh check "$version" "$workdir/release"
+  NPM="$NPM" "$NODE" scripts/update-npm-integrity.mjs "$version" "${extension_dirs[@]}"
+  git add -- "${lock_files[@]}"
+  if ! git diff --cached --quiet; then
+    git commit -s -m "chore: Update package-lock.json files"
+  fi
+  github_retry "$GH" release edit "$version" --draft=false
+  printf 'published landstrip %s\npush the integrity commit\n' "$version"
+  exit 0
 fi
+
+remote_commit="$(git ls-remote origin "refs/tags/$version^{}" | awk '{print $1}')"
+[[ -n "$remote_commit" && "$remote_commit" == "$tag_commit" ]] \
+  || die "push the signed tag $version to origin before staging the release"
+cargo_root="$repo_root"
+printf 'staging tag %s (%s)\n' "$version" "${tag_commit:0:12}"
 
 package_version="$($NODE -p "require('$cargo_root/packages/landstrip-api/package.json').version")"
 [[ "$version" == "$package_version" ]] \
@@ -380,31 +330,15 @@ for extension_dir in "${extension_dirs[@]}"; do
   npm_package_dirs+=("$repo_root/$extension_dir")
 done
 
-printf '%s\n' "validating npm packages"
+printf '%s\n' "packing npm packages locally"
 for package_dir in "${npm_package_dirs[@]}"; do
-  preflight_npm_package "$package_dir"
+  pack_npm_package "$package_dir"
 done
+scripts/publish-npm-provenance.sh preflight "$version" "$workdir/release"
 
 publish_cargo_package "$cargo_root/packages/landstrip"
-for package_dir in "${npm_package_dirs[@]}"; do
-  publish_npm_package "$package_dir"
-done
-
-package_names=("$($NODE -p 'require("./packages/landstrip-api/package.json").name')")
-while IFS= read -r package_name; do
-  package_names+=("$package_name")
-done < <($NODE -p 'Object.keys(require("./packages/landstrip-api/package.json").optionalDependencies).join("\n")')
-for package_name in "${package_names[@]}"; do
-  wait_for_npm_package "$package_name"
-done
-
-publish_github_release
-
-NPM="$NPM" "$NODE" scripts/update-npm-integrity.mjs "$version" "${extension_dirs[@]}"
-git add -- "${lock_files[@]}"
-if ! git diff --cached --quiet; then
-  git commit -s -m "chore: Update package-lock.json files"
-fi
-
-printf '%s\n' "published landstrip $version"
-printf '%s\n' "push the integrity commit"
+stage_github_release
+printf 'staged landstrip %s; npm tarballs were built locally\n' "$version"
+printf 'configure npm trusted publisher for each package: landstrip/landstrip, publish-npm.yml\n'
+printf 'run: gh workflow run publish-npm.yml --ref %s -f version=%s\n' "$version" "$version"
+printf 'after it succeeds, run: make publish-finish VERSION=%s\n' "$version"

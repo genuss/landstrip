@@ -1,0 +1,45 @@
+name: Publish locally packed npm tarballs
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Signed release tag, for example 1.2.3
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    if: github.ref_type == 'tag' && github.ref_name == inputs.version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - name: Install npm with OIDC trusted publishing support
+        run: npm install -g npm@11
+      - name: Download locally packed release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          test "$(gh release view "$VERSION" --json isDraft --jq .isDraft)" = true
+          mkdir -p "$RUNNER_TEMP/npm-release"
+          gh release download "$VERSION" --dir "$RUNNER_TEMP/npm-release" \
+            --pattern '*.tgz' --pattern '*.tgz.sha256'
+      - name: Verify all tarballs before publishing any
+        env:
+          VERSION: ${{ inputs.version }}
+        run: scripts/publish-npm-provenance.sh verify "$VERSION" "$RUNNER_TEMP/npm-release"
+      - name: Publish exact tarballs to npm with provenance
+        env:
+          VERSION: ${{ inputs.version }}
+        run: scripts/publish-npm-provenance.sh publish "$VERSION" "$RUNNER_TEMP/npm-release"
