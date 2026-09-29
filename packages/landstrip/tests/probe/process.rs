@@ -52,7 +52,7 @@ pub fn signal_thread_probe() -> i32 {
     let main_tid = unsafe { libc::gettid() };
     let result = std::thread::spawn(move || {
         // SAFETY: tgkill with signal 0 only checks permission.
-        unsafe { libc::tgkill(libc::getpid(), main_tid, 0) }
+        unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), main_tid, 0) }
     })
     .join();
     match result {

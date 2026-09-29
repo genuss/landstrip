@@ -73,6 +73,7 @@ pub fn fd_metadata_probe(
     operation: Option<std::ffi::OsString>,
 ) -> i32 {
     use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+    const SYS_FCHMODAT2: libc::c_long = 452;
 
     let (Some(path), Some(operation)) = (path, operation) else {
         return 2;
@@ -89,7 +90,7 @@ pub fn fd_metadata_probe(
         Some("fchmod") => unsafe { libc::fchmod(file.as_raw_fd(), 0o600) },
         Some("fchmodat2-empty") => unsafe {
             libc::syscall(
-                libc::SYS_fchmodat2,
+                SYS_FCHMODAT2,
                 file.as_raw_fd(),
                 c"".as_ptr(),
                 0o600,
@@ -99,7 +100,7 @@ pub fn fd_metadata_probe(
         Some("fchmodat2-invalid") => {
             let rc = unsafe {
                 libc::syscall(
-                    libc::SYS_fchmodat2,
+                    SYS_FCHMODAT2,
                     libc::AT_FDCWD,
                     path.as_ptr(),
                     0o600,
@@ -113,7 +114,7 @@ pub fn fd_metadata_probe(
         Some("fchmodat2-nofollow") => {
             let rc = unsafe {
                 libc::syscall(
-                    libc::SYS_fchmodat2,
+                    SYS_FCHMODAT2,
                     libc::AT_FDCWD,
                     path.as_ptr(),
                     0o600,
