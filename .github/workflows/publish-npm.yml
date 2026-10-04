@@ -8,6 +8,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: publish-npm
+  cancel-in-progress: false
+
 jobs:
   publish:
     if: github.ref == 'refs/heads/main'
@@ -26,6 +30,14 @@ jobs:
         with:
           ref: refs/tags/${{ inputs.version }}
           persist-credentials: false
+      - name: Check out publisher from workflow revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .npm-publisher
+          sparse-checkout: scripts/publish-npm-provenance.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -43,7 +55,7 @@ jobs:
       - name: Verify all tarballs before publishing any
         env:
           VERSION: ${{ inputs.version }}
-        run: scripts/publish-npm-provenance.sh verify "$VERSION" "$RUNNER_TEMP/npm-release"
+        run: .npm-publisher/scripts/publish-npm-provenance.sh verify "$VERSION" "$RUNNER_TEMP/npm-release"
       - name: Publish exact tarballs to npm with provenance
         env:
           VERSION: ${{ inputs.version }}
@@ -51,4 +63,4 @@ jobs:
         run: |
           : "${ACTIONS_ID_TOKEN_REQUEST_URL:?GitHub OIDC request URL is unavailable}"
           : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?GitHub OIDC request token is unavailable}"
-          scripts/publish-npm-provenance.sh publish "$VERSION" "$RUNNER_TEMP/npm-release"
+          .npm-publisher/scripts/publish-npm-provenance.sh publish "$VERSION" "$RUNNER_TEMP/npm-release"

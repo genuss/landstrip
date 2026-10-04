@@ -72,7 +72,7 @@ check_published() {
   local name="$1" file="$2" output error_file="$assets/npm-view-error"
   local digest
   digest="$($NODE -e 'const fs=require("fs"),crypto=require("crypto");process.stdout.write("sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"))' "$file")"
-  if ! output="$($NPM view "$name@$version" dist --json --fetch-retries=0 2>"$error_file")"; then
+  if ! output="$($NPM view "$name@$version" dist --json --prefer-online --fetch-retries=0 2>"$error_file")"; then
     if grep -q E404 "$error_file"; then return 1; fi
     printf 'npm registry query failed for %s@%s\n' "$name" "$version" >&2
     command cat "$error_file" >&2
@@ -102,12 +102,23 @@ for path in "${archives[@]}"; do
       continue
     fi
     ((status == 1)) || exit "$status"
-    "$NPM" publish "$path" --access public --provenance
+    publish_error="$assets/npm-publish-error"
+    status=0
+    "$NPM" publish "$path" --access public --provenance 2>"$publish_error" || status=$?
+    command cat "$publish_error" >&2
+    if ((status != 0)); then
+      if ! grep -Fq 'npm error code E409' "$publish_error" ||
+         ! grep -Fq "Cannot publish over previously staged version \"$version\"." "$publish_error"; then
+        exit "$status"
+      fi
+      printf 'already staged; waiting for registry verification: %s@%s\n' "$name" "$version"
+    fi
     for attempt in {1..60}; do
       status=0
       check_published "$name" "$path" || status=$?
       ((status == 1)) || break
       ((attempt < 60)) || { printf 'npm package not available: %s@%s\n' "$name" "$version" >&2; exit 1; }
+      printf 'waiting for registry visibility: %s@%s (attempt %s/60)\n' "$name" "$version" "$attempt"
       sleep 10
     done
     ((status == 0)) || exit "$status"
