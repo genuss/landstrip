@@ -47,4 +47,8 @@ jobs:
       - name: Publish exact tarballs to npm with provenance
         env:
           VERSION: ${{ inputs.version }}
-        run: scripts/publish-npm-provenance.sh publish "$VERSION" "$RUNNER_TEMP/npm-release"
+          NPM_CONFIG_LOGLEVEL: verbose
+        run: |
+          : "${ACTIONS_ID_TOKEN_REQUEST_URL:?GitHub OIDC request URL is unavailable}"
+          : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?GitHub OIDC request token is unavailable}"
+          scripts/publish-npm-provenance.sh publish "$VERSION" "$RUNNER_TEMP/npm-release"
