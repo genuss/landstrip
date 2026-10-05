@@ -2,7 +2,6 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import { type ChildProcess, spawn, spawnSync, type StdioOptions } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -41,17 +40,31 @@ import {
   type LandstripControlResponse,
   type LandstripFilesystemTrap,
   type LandstripNetworkTrap,
+  type LandstripPolicy,
+  type SandboxConfig as BaseSandboxConfig,
+  type SandboxConfigFile,
+  type SandboxFilesystemConfig,
+  type SandboxShellConfig,
+  type SandboxWindowsConfig,
+  type ShellReadAccess,
 } from '@landstrip/landstrip-api';
 import {
+  buildLandstripPolicy as assembleLandstripPolicy,
   allowsAllDomains,
   controlResponseLine,
+  deepMergeSandboxConfig as deepMerge,
   domainMatchesAny,
+  evaluateDomainAccess,
   formatLandstripTraps,
   isDenialTrap,
   isFilesystemTrap,
+  isPathReadAllowed,
   isRecord,
   isQueryTrap,
+  matchesPathPattern,
+  mergeArray,
   parseLandstripTraps,
+  parseSandboxConfig,
   canonicalizeGlobPattern,
   canonicalizePath,
   expandPath,
@@ -60,17 +73,38 @@ import {
   parseTrapLine,
   pathUnderDirectory,
   sessionScopeFor,
+  serializeLandstripPolicy,
+  shouldPromptForWrite as sharedShouldPromptForWrite,
+  normalizeBlockedPath,
+  extractNativeDeniedPath,
+  extractNativeWriteDeniedPath,
+  extractDeniedPath,
+  extractTrapBlockedPath,
 } from '@landstrip/landstrip-api/shared';
-import { type ProxyPortRange, startFilterProxy } from '@landstrip/landstrip-api/proxy';
+import {
+  type ProxyPortRange,
+  createProxyCredentials,
+  createProxyEnvironment,
+  startFilterProxy,
+} from '@landstrip/landstrip-api/proxy';
 
 export {
   controlResponseLine,
   domainMatchesAny,
+  extractDeniedPath,
+  extractNativeDeniedPath,
+  extractNativeWriteDeniedPath,
   formatLandstripTraps,
   isQueryTrap,
   parseTrapLine,
   sessionScopeFor,
+  type ShellReadAccess,
 };
+
+export interface SandboxConfig extends BaseSandboxConfig {
+  shell: SandboxShellConfig;
+  windows: SandboxWindowsConfig;
+}
 import {
   type LandstripContextV2,
   type LandstripEvent,
@@ -100,185 +134,7 @@ import { formatError, PermissionPromptCoordinator } from './util.ts';
 
 type LandstripBashTool = ReturnType<typeof createBashToolDefinition>;
 
-interface SandboxFilesystemConfig {
-  denyRead: string[];
-  denyReadAlways: string[];
-  allowRead: string[];
-  allowWrite: string[];
-  denyWrite: string[];
-}
-
-export type ShellReadAccess = 'host' | 'policy';
-
-interface SandboxShellConfig {
-  readAccess: ShellReadAccess;
-}
-
-interface SandboxNetworkConfig {
-  allowNetwork: boolean;
-  allowLocalBinding: boolean;
-  allowAllUnixSockets: boolean;
-  allowUnixSockets: string[];
-  allowedDomains: string[];
-  deniedDomains: string[];
-}
-
-interface SandboxWindowsConfig {
-  appContainerMode: 'lpac' | 'standard';
-  allowLoopback: boolean;
-}
-
-export interface SandboxConfig {
-  enabled: boolean;
-  shell: SandboxShellConfig;
-  network: SandboxNetworkConfig;
-  filesystem: SandboxFilesystemConfig;
-  windows: SandboxWindowsConfig;
-}
-
-type SandboxFilesystemConfigFile = Partial<SandboxFilesystemConfig>;
-type SandboxShellConfigFile = Partial<SandboxShellConfig>;
-type SandboxNetworkConfigFile = Partial<SandboxNetworkConfig>;
-type SandboxWindowsConfigFile = Partial<SandboxWindowsConfig>;
-
-interface SandboxConfigFile {
-  enabled?: boolean;
-  shell?: SandboxShellConfigFile;
-  network?: SandboxNetworkConfigFile;
-  filesystem?: SandboxFilesystemConfigFile;
-  windows?: SandboxWindowsConfigFile;
-}
-
-function requireSandboxObject(
-  value: unknown,
-  field: string,
-): asserts value is Record<string, unknown> {
-  if (!isRecord(value)) throw new Error(`${field} must be an object`);
-}
-
-function rejectUnknownSandboxFields(
-  value: Record<string, unknown>,
-  fields: readonly string[],
-  prefix = '',
-): void {
-  for (const field of Object.keys(value)) {
-    if (!fields.includes(field)) throw new Error(`unknown sandbox field ${prefix}${field}`);
-  }
-}
-
-function validateBooleanFields(
-  value: Record<string, unknown>,
-  fields: readonly string[],
-  prefix = '',
-): void {
-  for (const field of fields) {
-    if (value[field] !== undefined && typeof value[field] !== 'boolean') {
-      throw new Error(`${prefix}${field} must be a boolean`);
-    }
-  }
-}
-
-function validateStringArrayFields(
-  value: Record<string, unknown>,
-  fields: readonly string[],
-  prefix: string,
-): void {
-  for (const field of fields) {
-    const entry = value[field];
-    if (entry === undefined) continue;
-    if (!Array.isArray(entry) || [...entry].some((item) => typeof item !== 'string')) {
-      throw new Error(`${prefix}${field} must be an array of strings`);
-    }
-  }
-}
-
-function parseSandboxConfig(value: unknown): SandboxConfigFile {
-  requireSandboxObject(value, 'sandbox config');
-  rejectUnknownSandboxFields(value, ['enabled', 'shell', 'network', 'filesystem', 'windows']);
-  validateBooleanFields(value, ['enabled']);
-
-  if (value.shell !== undefined) {
-    requireSandboxObject(value.shell, 'shell');
-    rejectUnknownSandboxFields(value.shell, ['readAccess'], 'shell.');
-    if (
-      value.shell.readAccess !== undefined &&
-      value.shell.readAccess !== 'host' &&
-      value.shell.readAccess !== 'policy'
-    ) {
-      throw new Error('shell.readAccess must be host or policy');
-    }
-  }
-
-  if (value.network !== undefined) {
-    requireSandboxObject(value.network, 'network');
-    rejectUnknownSandboxFields(
-      value.network,
-      [
-        'allowNetwork',
-        'allowLocalBinding',
-        'allowAllUnixSockets',
-        'allowUnixSockets',
-        'allowedDomains',
-        'deniedDomains',
-      ],
-      'network.',
-    );
-    validateBooleanFields(
-      value.network,
-      ['allowNetwork', 'allowLocalBinding', 'allowAllUnixSockets'],
-      'network.',
-    );
-    validateStringArrayFields(
-      value.network,
-      ['allowUnixSockets', 'allowedDomains', 'deniedDomains'],
-      'network.',
-    );
-  }
-
-  if (value.filesystem !== undefined) {
-    requireSandboxObject(value.filesystem, 'filesystem');
-    rejectUnknownSandboxFields(
-      value.filesystem,
-      ['denyRead', 'denyReadAlways', 'allowRead', 'allowWrite', 'denyWrite'],
-      'filesystem.',
-    );
-    validateStringArrayFields(
-      value.filesystem,
-      ['denyRead', 'denyReadAlways', 'allowRead', 'allowWrite', 'denyWrite'],
-      'filesystem.',
-    );
-  }
-
-  if (value.windows !== undefined) {
-    requireSandboxObject(value.windows, 'windows');
-    rejectUnknownSandboxFields(value.windows, ['appContainerMode', 'allowLoopback'], 'windows.');
-    validateBooleanFields(value.windows, ['allowLoopback'], 'windows.');
-    if (
-      value.windows.appContainerMode !== undefined &&
-      value.windows.appContainerMode !== 'lpac' &&
-      value.windows.appContainerMode !== 'standard'
-    ) {
-      throw new Error('windows.appContainerMode must be lpac or standard');
-    }
-  }
-
-  return value as SandboxConfigFile;
-}
-
 export type SandboxConfigScope = 'global' | 'project';
-
-interface LandstripPolicy {
-  network: {
-    allowNetwork: boolean;
-    allowLocalBinding: boolean;
-    allowAllUnixSockets: boolean;
-    allowUnixSockets: string[];
-    httpProxyPort?: number;
-    socksProxyPort?: number;
-  };
-  filesystem: SandboxFilesystemConfig;
-  windows: SandboxWindowsConfig;
-}
 
 export type PolicyAudience = 'shell' | 'worker';
 
@@ -323,14 +179,6 @@ const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32'
 // Grace period after the child exits for its stdio to drain before we stop
 // waiting; matches pi's own bash backend so a backgrounded process cannot hang us.
 const EXIT_STDIO_GRACE_MS = 100;
-const PROXY_ENVIRONMENT_VARIABLES = [
-  'HTTP_PROXY',
-  'HTTPS_PROXY',
-  'ALL_PROXY',
-  'http_proxy',
-  'https_proxy',
-  'all_proxy',
-] as const;
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 type PermissionChoice = 'abort' | 'once' | 'session' | 'project' | 'global';
@@ -393,44 +241,6 @@ function loadSandboxConfig(
       globalOverrides.filesystem?.denyRead ?? [],
       projectOverrides.filesystem?.denyRead,
     ),
-  };
-}
-
-function mergeArray(base: string[], override?: string[]): string[] {
-  if (!override) return base;
-  return [...new Set([...base, ...override])];
-}
-
-function deepMerge(base: SandboxConfig, overrides: SandboxConfigFile): SandboxConfig {
-  const shell = overrides.shell;
-  const network = overrides.network;
-  const filesystem = overrides.filesystem;
-  const windows = overrides.windows;
-
-  return {
-    enabled: overrides.enabled ?? base.enabled,
-    shell: {
-      readAccess: shell?.readAccess ?? base.shell.readAccess,
-    },
-    network: {
-      allowNetwork: network?.allowNetwork ?? base.network.allowNetwork,
-      allowLocalBinding: network?.allowLocalBinding ?? base.network.allowLocalBinding,
-      allowAllUnixSockets: network?.allowAllUnixSockets ?? base.network.allowAllUnixSockets,
-      allowUnixSockets: mergeArray(base.network.allowUnixSockets, network?.allowUnixSockets),
-      allowedDomains: mergeArray(base.network.allowedDomains, network?.allowedDomains),
-      deniedDomains: mergeArray(base.network.deniedDomains, network?.deniedDomains),
-    },
-    filesystem: {
-      denyRead: mergeArray(base.filesystem.denyRead, filesystem?.denyRead),
-      denyReadAlways: mergeArray(base.filesystem.denyReadAlways, filesystem?.denyReadAlways),
-      allowRead: mergeArray(base.filesystem.allowRead, filesystem?.allowRead),
-      allowWrite: mergeArray(base.filesystem.allowWrite, filesystem?.allowWrite),
-      denyWrite: mergeArray(base.filesystem.denyWrite, filesystem?.denyWrite),
-    },
-    windows: {
-      appContainerMode: windows?.appContainerMode ?? base.windows.appContainerMode,
-      allowLoopback: windows?.allowLoopback ?? base.windows.allowLoopback,
-    },
   };
 }
 
@@ -564,7 +374,7 @@ function mergeAllowances(base: string[], session: string[], execution?: string[]
 }
 
 export function shouldPromptForWrite(path: string, allowWrite: string[], cwd: string): boolean {
-  return allowWrite.length === 0 || !matchesPattern(path, allowWrite, cwd);
+  return sharedShouldPromptForWrite(path, allowWrite, cwd);
 }
 
 export function matchesPattern(
@@ -573,6 +383,9 @@ export function matchesPattern(
   cwd: string,
   explicitDenyGlobRoots?: Map<string, string[]>,
 ): boolean {
+  if (!explicitDenyGlobRoots) {
+    return matchesPathPattern(filePath, patterns, cwd);
+  }
   const abs = normalizePathSeparators(canonicalizePath(filePath, cwd));
 
   return patterns.some((pattern) => {
@@ -649,103 +462,13 @@ export function matchesPattern(
   });
 }
 
-function normalizeBlockedPath(path: string, cwd: string): string {
-  const nativePath =
-    process.platform === 'win32' && /^\/[a-zA-Z](?:\/|$)/.test(path)
-      ? `${path[1]}:${path.slice(2)}`
-      : path;
-  return canonicalizePath(isAbsolute(nativePath) ? nativePath : join(cwd, nativePath), cwd);
-}
-
-// Length of the longest entry in `patterns` that matches `path`, or -1 for no
-// match. Canonicalized so the value reflects how specific the rule is.
-function longestPrefixMatch(path: string, patterns: string[], cwd: string): number {
-  let best = -1;
-  for (const pattern of patterns) {
-    if (!matchesPattern(path, [pattern], cwd)) continue;
-    const canonical = canonicalizeGlobPattern(pattern, cwd);
-    if (canonical.length > best) best = canonical.length;
-  }
-  return best;
-}
-
-// Reads are unrestricted outside denyRead. Within a denied root, the most
-// specific matching rule wins: an explicit allow (e.g. a granted `~/.cache`)
-// overrides the broad `denyRead` gate (`/home`), while a narrow denyRead
-// carve-out still beats a broad allow. Ties favor allow.
 export function readAllowed(
   path: string,
   allowRead: string[],
   denyRead: string[],
   cwd: string,
 ): boolean {
-  const deny = longestPrefixMatch(path, denyRead, cwd);
-  if (deny < 0) return true;
-  return longestPrefixMatch(path, allowRead, cwd) >= deny;
-}
-
-function isPathLike(value: string): boolean {
-  const trimmed = value.trim();
-  return (
-    trimmed === '~' ||
-    trimmed.startsWith('/') ||
-    trimmed.startsWith('\\\\') ||
-    /^[a-zA-Z]:[\\/]/.test(trimmed) ||
-    trimmed.startsWith('~/') ||
-    trimmed.startsWith('~\\') ||
-    trimmed.startsWith('./') ||
-    trimmed.startsWith('.\\') ||
-    trimmed.startsWith('../') ||
-    trimmed.startsWith('..\\') ||
-    trimmed.startsWith('.') ||
-    trimmed.includes('/') ||
-    trimmed.includes('\\')
-  );
-}
-
-function normalizePathMatch(value: string, cwd: string): string | null {
-  return isPathLike(value) ? normalizeBlockedPath(value, cwd) : null;
-}
-
-// Structured traps come only from the trap socket (fd 3); the sandboxed command
-// controls its own stderr and could forge a trap line, so these `extractBlocked*`
-// helpers must be fed only that trusted channel. Agent-controlled stderr is read
-// with the `extractNative*` regexes instead, which match a real kernel-denial
-// message rather than a JSON record.
-function extractBlockedPath(trapOutput: string, cwd: string): string | null {
-  const landstripErrors = parseLandstripTraps(trapOutput).filter(isFilesystemTrap);
-  if (landstripErrors.length > 0) {
-    return normalizeBlockedPath(landstripErrors[0].path, cwd);
-  }
-
-  return null;
-}
-
-export function extractNativeDeniedPath(output: string, cwd: string): string | null {
-  const denial = String.raw`(?:Access is denied\.?|Operation not permitted|Permission denied)`;
-  let match = output.match(new RegExp(String.raw`['"]([^'"\n]+)['"][^\r\n]{0,120}${denial}`, 'i'));
-  if (match) return normalizePathMatch(match[1], cwd);
-
-  // bash/sh and native Windows tools: line X: /path: Permission denied,
-  // or cmd: C:\path: Access is denied.
-  match = output.match(
-    new RegExp(
-      String.raw`(?:^|:\s+)((?:[a-zA-Z]:[\\/]|\\\\|/|\.{1,2}[\\/])[^\r\n]*?):\s+${denial}$`,
-      'im',
-    ),
-  );
-  if (match) return normalizePathMatch(match[1], cwd);
-
-  // ls/cat/cp: cannot open/access/stat '/path': Permission denied
-  match = output.match(
-    new RegExp(
-      String.raw`^[a-zA-Z0-9_-]+: cannot (?:open|access|stat|create)(?: directory)? '?([^'\n]+?)'?(?: for (?:reading|writing))?: ${denial}$`,
-      'im',
-    ),
-  );
-  if (match) return normalizePathMatch(match[1], cwd);
-
-  return null;
+  return isPathReadAllowed(path, allowRead, denyRead, cwd);
 }
 
 function extractDeniedPathMention(
@@ -781,49 +504,6 @@ export function extractRetryableNativeReadDeniedPath(
   const path = extractNativeDeniedPath(output, cwd);
   if (path) return denied(path) ? path : null;
   return extractDeniedPathMention(output, cwd, denied);
-}
-
-export function extractNativeWriteDeniedPath(output: string, cwd: string): string | null {
-  const denial = String.raw`(?:Access is denied\.?|Operation not permitted|Permission denied)`;
-  let match = output.match(
-    new RegExp(
-      String.raw`(?:[Uu]nable to create|failed to create(?: directory)?|cannot (?:create|touch|mkdir|remove|unlink|rename)|for writing)[^'"\x60\r\n]*['"\x60]([^'"\x60\r\n]+)['"\x60](?:[^\r\n]*\r?\n){0,3}[^\r\n]{0,120}${denial}`,
-      'im',
-    ),
-  );
-  if (match) return normalizePathMatch(match[1], cwd);
-
-  match = output.match(
-    new RegExp(
-      String.raw`^[a-zA-Z0-9_-]+: cannot create(?: directory)? '?([^'\n]+?)'?(?: for writing)?: ${denial}$`,
-      'im',
-    ),
-  );
-  if (match) return normalizePathMatch(match[1], cwd);
-
-  match = output.match(
-    new RegExp(
-      String.raw`^[a-zA-Z0-9_-]+: couldn't open temporary file ((?:[a-zA-Z]:[\\/]|\\\\|/)[^\r\n]*?): ${denial}$`,
-      'im',
-    ),
-  );
-  if (match) return normalizePathMatch(match[1], cwd);
-
-  return null;
-}
-
-function extractTrapBlockedPath(
-  trapOutput: string,
-  cwd: string,
-  operation: 'read' | 'write',
-): string | null {
-  for (const error of parseLandstripTraps(trapOutput).filter(isFilesystemTrap)) {
-    if (error.operation === operation) {
-      return normalizeBlockedPath(error.path, cwd);
-    }
-  }
-
-  return null;
 }
 
 function notify(ctx: ExtensionContext, message: string, level: NotificationLevel): void {
@@ -945,13 +625,10 @@ export function writeEnvFile(
     lines.push(`export ${key}='${escaped}'`);
   }
   if (proxyPort !== null) {
-    const credentials = proxyToken === undefined ? '' : `landstrip:${proxyToken}@`;
-    const url = `http://${credentials}127.0.0.1:${proxyPort}`;
-    for (const name of PROXY_ENVIRONMENT_VARIABLES) {
-      lines.push(`export ${name}='${url}'`);
+    const proxyVars = createProxyEnvironment(proxyPort, proxyToken);
+    for (const [name, value] of Object.entries(proxyVars)) {
+      lines.push(`export ${name}='${value}'`);
     }
-    lines.push("export NO_PROXY=''");
-    lines.push("export no_proxy=''");
   }
   const dir = mkdtempSync(join(tmpdir(), 'pi-landstrip-env-'));
   const path = join(dir, 'env.sh');
@@ -992,14 +669,7 @@ function shellEnvironment(
   proxyToken?: string,
 ): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = { ...process.env, ...env, PWD: resolve(cwd) };
-  if (proxyPort === null) return result;
-
-  const credentials = proxyToken === undefined ? '' : `landstrip:${proxyToken}@`;
-  const url = `http://${credentials}127.0.0.1:${proxyPort}`;
-  for (const name of PROXY_ENVIRONMENT_VARIABLES) result[name] = url;
-  result.NO_PROXY = '';
-  result.no_proxy = '';
-  return result;
+  return createProxyEnvironment(proxyPort, proxyToken, result);
 }
 
 export function createLandstripLauncherEnvironment(
@@ -1497,7 +1167,7 @@ function createLandstripIntegrationWithPrompts(
             access.path,
             access.operation === 'read'
               ? config.filesystem.denyReadAlways
-              : config.filesystem.denyWrite,
+              : mergeArray(config.filesystem.denyWriteAlways, config.filesystem.denyWrite),
             ctx.cwd,
           )
         ) {
@@ -1575,13 +1245,12 @@ function createLandstripIntegrationWithPrompts(
   ): Promise<boolean> {
     const current = (): boolean | undefined => {
       const config = loadConfig(cwd);
-      if (domainMatchesAny(domain, config.network.deniedDomains)) return false;
-      const allowedDomains = mergeAllowances(
-        config.network.allowedDomains,
-        sessionAllowedDomains,
-        allowances?.domains,
-      );
-      if (domainMatchesAny(domain, allowedDomains)) return true;
+      const decision = evaluateDomainAccess(domain, config.network, [
+        ...sessionAllowedDomains,
+        ...(allowances?.domains ?? []),
+      ]);
+      if (decision === 'deny') return false;
+      if (decision === 'allow') return true;
       return undefined;
     };
     if (!ctx.hasUI) return current() ?? false;
@@ -1621,22 +1290,18 @@ function createLandstripIntegrationWithPrompts(
       getEffectiveAllowRead(config, cwd, allowances),
     );
 
-    return {
-      network: {
-        allowNetwork: config.network.allowNetwork,
-        allowLocalBinding: config.network.allowLocalBinding,
-        allowAllUnixSockets: config.network.allowAllUnixSockets,
-        allowUnixSockets: config.network.allowUnixSockets,
-        ...(proxyPort !== null ? { httpProxyPort: proxyPort } : {}),
-      },
+    return assembleLandstripPolicy({
+      network: config.network,
       filesystem: {
         ...readPolicy,
         denyReadAlways: mergeArray(config.filesystem.denyReadAlways, allowances?.protectedPaths),
         allowWrite: getEffectiveAllowWrite(config, allowances),
         denyWrite: mergeArray(config.filesystem.denyWrite, allowances?.protectedPaths),
+        denyWriteAlways: mergeArray(config.filesystem.denyWriteAlways, allowances?.protectedPaths),
       },
       windows: config.windows,
-    };
+      httpProxyPort: proxyPort,
+    });
   }
 
   function writePolicyFile(
@@ -1649,10 +1314,9 @@ function createLandstripIntegrationWithPrompts(
     const path = join(dir, 'policy.json');
     writeFileSync(
       path,
-      JSON.stringify(buildLandstripPolicy(cwd, proxyPort, audience, allowances), null, 2) + '\n',
+      serializeLandstripPolicy(buildLandstripPolicy(cwd, proxyPort, audience, allowances)),
       'utf-8',
     );
-
     return { dir, path };
   }
 
@@ -1769,7 +1433,11 @@ function createLandstripIntegrationWithPrompts(
       ) {
         return { action: 'deny', reason: 'hard-deny' };
       }
-      if (trap.operation === 'write' && matchesPattern(path, config.filesystem.denyWrite, cwd)) {
+      if (
+        trap.operation === 'write' &&
+        (matchesPattern(path, config.filesystem.denyWriteAlways, cwd) ||
+          matchesPattern(path, config.filesystem.denyWrite, cwd))
+      ) {
         return { action: 'deny', reason: 'hard-deny' };
       }
       const allowed =
@@ -1973,8 +1641,7 @@ function createLandstripIntegrationWithPrompts(
         );
       }
     }
-    const proxyToken = randomBytes(32).toString('base64url');
-    const proxyAuthorization = `Basic ${Buffer.from(`landstrip:${proxyToken}`).toString('base64')}`;
+    const { token: proxyToken, authorization: proxyAuthorization } = createProxyCredentials();
     const proxy = shouldStartProxy(config)
       ? await startProxy(
           options.ctx,
@@ -2008,15 +1675,7 @@ function createLandstripIntegrationWithPrompts(
     const workerPolicy = policy;
     const workerTrapSocket = trapSocket;
     const workerChildEnd = childEnd;
-    const workerEnv = { ...options.env };
-    if (proxy) {
-      const url = `http://landstrip:${proxyToken}@127.0.0.1:${proxy.port}`;
-      for (const name of PROXY_ENVIRONMENT_VARIABLES) {
-        workerEnv[name] = url;
-      }
-      workerEnv.NO_PROXY = '';
-      workerEnv.no_proxy = '';
-    }
+    const workerEnv = createProxyEnvironment(proxy?.port ?? null, proxyToken, options.env ?? {});
     let spawned = false;
     let disposePromise: Promise<void> | undefined;
     let preparedChild: ChildProcess | undefined;
@@ -2208,8 +1867,7 @@ function createLandstripIntegrationWithPrompts(
 
         const provider = activeShellProvider();
         const config = loadConfig(cwd);
-        const proxyToken = randomBytes(32).toString('base64url');
-        const proxyAuthorization = `Basic ${Buffer.from(`landstrip:${proxyToken}`).toString('base64')}`;
+        const { token: proxyToken, authorization: proxyAuthorization } = createProxyCredentials();
         const proxy = shouldStartProxy(config)
           ? await startProxy(
               ctx,
@@ -2361,7 +2019,8 @@ function createLandstripIntegrationWithPrompts(
                 // Windows, where --trap is unsupported, use native
                 // kernel-denial text from stderr.
                 const blockedPath =
-                  extractBlockedPath(errorFdAcc, cwd) ?? extractNativeDeniedPath(stderrAcc, cwd);
+                  extractTrapBlockedPath(errorFdAcc, cwd) ??
+                  extractNativeDeniedPath(stderrAcc, cwd);
                 if (!blockedPath && ctx.hasUI) {
                   const traps = parseLandstripTraps(errorFdAcc);
                   const denials = traps.filter(isDenialTrap);
@@ -2559,7 +2218,9 @@ function createLandstripIntegrationWithPrompts(
         if (
           matchesPattern(
             blockedPath,
-            operation === 'read' ? config.filesystem.denyReadAlways : config.filesystem.denyWrite,
+            operation === 'read'
+              ? config.filesystem.denyReadAlways
+              : mergeArray(config.filesystem.denyWriteAlways, config.filesystem.denyWrite),
             ctx.cwd,
           )
         ) {
@@ -2614,11 +2275,15 @@ function createLandstripIntegrationWithPrompts(
         const config = loadConfig(ctx.cwd);
         if (
           operation === 'write' &&
-          matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd)
+          (matchesPattern(blockedPath, config.filesystem.denyWriteAlways, ctx.cwd) ||
+            matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd))
         ) {
+          const tier = matchesPattern(blockedPath, config.filesystem.denyWriteAlways, ctx.cwd)
+            ? 'denyWriteAlways'
+            : 'denyWrite';
           notify(
             ctx,
-            `"${blockedPath}" is blocked by denyWrite. Check:\n  ${projectPath}\n  ${globalPath}`,
+            `"${blockedPath}" is blocked by ${tier}. Check:\n  ${projectPath}\n  ${globalPath}`,
             'warning',
           );
         }
@@ -2628,11 +2293,15 @@ function createLandstripIntegrationWithPrompts(
       let config = loadConfig(ctx.cwd);
       if (
         operation === 'write' &&
-        matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd)
+        (matchesPattern(blockedPath, config.filesystem.denyWriteAlways, ctx.cwd) ||
+          matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd))
       ) {
+        const tier = matchesPattern(blockedPath, config.filesystem.denyWriteAlways, ctx.cwd)
+          ? 'denyWriteAlways'
+          : 'denyWrite';
         notify(
           ctx,
-          `"${blockedPath}" was added to allowWrite, but denyWrite still blocks it. Check:\n  ${projectPath}\n  ${globalPath}`,
+          `"${blockedPath}" was added to allowWrite, but ${tier} still blocks it. Check:\n  ${projectPath}\n  ${globalPath}`,
           'warning',
         );
         return null;

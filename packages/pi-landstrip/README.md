@@ -49,6 +49,9 @@ Worker read boundaries:
   or shell host reads. Private workers protect parent auth-file and lock roots
   with this policy and `denyWrite`. Non-empty `denyReadAlways` and private worker
   auth are unsupported on Windows.
+- `filesystem.denyWriteAlways` cannot be overridden by equal/nested write grants
+  or interactive prompts; write attempts are silently rejected. Non-empty
+  `denyWriteAlways` is unsupported on Windows.
 - External skill, prompt, and theme directories may need explicit discovery
   access. Prefer resource file paths: resolved-file grants do not cover enclosing
   directories.

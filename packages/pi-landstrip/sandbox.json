@@ -23,7 +23,8 @@
       "**/*.key",
       ".pi/sandbox.json",
       "~/.pi/agent/sandbox.json"
-    ]
+    ],
+    "denyWriteAlways": []
   },
   "windows": {
     "appContainerMode": "standard",
