@@ -190,7 +190,7 @@ test('permission evaluation hard-denies denyReadAlways and denyWriteAlways witho
   );
 });
 
-test('proxy authenticates requests and connects to allowed private destinations', async () => {
+test('proxy authenticates requests and connects to allowed private destinations', async (t) => {
   let connections = 0;
   const upstreamSockets = new Set();
   const upstream = createServer((socket) => {
@@ -201,10 +201,18 @@ test('proxy authenticates requests and connects to allowed private destinations'
   });
 
   try {
-    await new Promise((resolve, reject) => {
-      upstream.once('error', reject);
-      upstream.listen(0, '127.0.0.1', resolve);
-    });
+    try {
+      await new Promise((resolve, reject) => {
+        upstream.once('error', reject);
+        upstream.listen(0, '127.0.0.1', resolve);
+      });
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'EPERM') {
+        t.skip('Local socket binding not permitted in this environment');
+        return;
+      }
+      throw error;
+    }
     const address = upstream.address();
     assert.ok(address && typeof address !== 'string');
     await withPlugin(
@@ -289,9 +297,11 @@ test('proxy authenticates requests and connects to allowed private destinations'
     );
   } finally {
     for (const socket of upstreamSockets) socket.destroy();
-    await new Promise((resolve, reject) =>
-      upstream.close((error) => (error ? reject(error) : resolve())),
-    );
+    if (upstream.listening) {
+      await new Promise((resolve, reject) =>
+        upstream.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
   }
 });
 
