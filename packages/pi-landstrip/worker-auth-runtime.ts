@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import type { AuthResult, Model } from '@earendil-works/pi-ai';
-import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import type { AuthResult } from '@earendil-works/pi-ai';
+import type { ExtensionContext, ModelRuntime } from '@earendil-works/pi-coding-agent';
+
+type ExtensionModel = NonNullable<ExtensionContext['model']>;
 
 /**
  * Compose the worker's existing stream implementation with parent-owned auth.
@@ -12,7 +14,7 @@ import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
 export async function createWorkerAuthRuntime(
   catalog: ModelRuntime,
   runtime: ModelRuntime,
-  model: Model<any>,
+  model: ExtensionModel,
   resolveAuth: (signal: AbortSignal) => Promise<AuthResult>,
 ): Promise<ModelRuntime> {
   if (!catalog.getProvider(model.provider)) {

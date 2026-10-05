@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import type { AuthResult, Model } from '@earendil-works/pi-ai';
+import type { AuthResult } from '@earendil-works/pi-ai';
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { canonicalizeHost } from '@landstrip/landstrip-api/shared';
 
+type ExtensionModel = NonNullable<ExtensionContext['model']>;
+
 export interface WorkerAuthSnapshot {
-  model: Model<any>;
+  model: ExtensionModel;
   auth: AuthResult;
 }
 
@@ -41,7 +43,11 @@ const PROVIDER_ENVIRONMENT_KEYS: Readonly<Record<string, readonly string[]>> = {
 
 class UnsupportedWorkerAuthError extends Error {}
 
-function providerRequestAuth(provider: string, result: AuthResult, model?: Model<any>): AuthResult {
+function providerRequestAuth(
+  provider: string,
+  result: AuthResult,
+  model?: ExtensionModel,
+): AuthResult {
   const implementation = model?.api === 'bedrock-converse-stream' ? 'amazon-bedrock' : model?.api;
   const selected =
     implementation && Object.hasOwn(PROVIDER_ENVIRONMENT_KEYS, implementation)
@@ -107,7 +113,7 @@ export async function resolveWorkerAuth(
   registry: ExtensionContext['modelRegistry'],
   provider: string,
   signal: AbortSignal,
-  model?: Model<any>,
+  model?: ExtensionModel,
 ): Promise<AuthResult | undefined> {
   if (signal.aborted) throw new Error('Task cancelled');
   let abort = () => {};
@@ -178,7 +184,7 @@ export function workerAuthHost(baseUrl: unknown): string | undefined {
 /** Each request resolves afresh in the parent, retaining its OAuth locking/refresh behavior. */
 export function workerAuthResolver(
   registry: ExtensionContext['modelRegistry'],
-  selected: Model<any>,
+  selected: ExtensionModel,
   domains: readonly string[],
 ): (signal: AbortSignal) => Promise<WorkerAuthSnapshot> {
   // The selected model is pinned before any asynchronous auth work.

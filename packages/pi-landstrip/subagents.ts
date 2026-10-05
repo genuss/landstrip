@@ -2820,7 +2820,10 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       },
       renderResult: (result, { expanded }, theme) => {
         const details = result.details;
-        const fallback = result.content.find((item) => item.type === 'text')?.text ?? '(no output)';
+        const fallback =
+          result.content.find(
+            (item): item is { type: 'text'; text: string } => item.type === 'text',
+          )?.text ?? '(no output)';
         if (!details) return new Text(fallback, 0, 0);
 
         const stateView: SubagentTaskView = {

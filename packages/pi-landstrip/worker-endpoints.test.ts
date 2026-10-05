@@ -14,7 +14,7 @@ import {
   type LandstripIntegration,
   type LandstripRpcWorkerOptions,
 } from './index.ts';
-import { modelEndpointDomains, SubagentRuntime } from './subagents.ts';
+import { SubagentRuntime } from './subagents.ts';
 import { temporaryDirectory } from './test-util.ts';
 const secret = 'AUTH_SECRET_SENTINEL';
 const selected = {
