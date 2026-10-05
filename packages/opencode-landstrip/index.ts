@@ -10,38 +10,37 @@ import { type AddressInfo, connect as connectNet, createServer } from 'node:net'
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
-import { startFilterProxy } from '@landstrip/landstrip-api/proxy';
+import {
+  createProxyCredentials,
+  createProxyEnvironment,
+  startFilterProxy,
+} from '@landstrip/landstrip-api/proxy';
 
 import {
   type LandstripTrap,
   type SandboxConfig,
-  type SandboxFilesystemConfig,
   allowsAllDomains,
-  canonicalizeGlobPattern,
   canonicalizePath,
   controlResponseLine,
   decodeLandstripTrap,
-  domainMatchesAny,
+  evaluateDomainAccess,
+  evaluateReadAccess,
+  evaluateWriteAccess,
   extractDomainsFromCommand,
+  extractDeniedPath,
   formatLandstripTraps,
   getConfigPaths,
-  globToRegExp,
+  isDomainAllowed,
   isRecord,
+  buildLandstripPolicy,
   landstripBinaryPath,
   loadConfig,
   normalizeOptions,
-  normalizePathSeparators,
   parseLandstripTraps,
   readDiscoveryPort,
+  serializeLandstripPolicy,
   trapSessionHelloLine,
 } from './shared.js';
-
-type LandstripPolicy = {
-  network: Omit<SandboxConfig['network'], 'allowedDomains' | 'deniedDomains'> & {
-    httpProxyPort?: number;
-  };
-  filesystem: SandboxFilesystemConfig;
-};
 
 interface BashSandboxState {
   originalCommand: string;
@@ -72,148 +71,6 @@ const REQUIRED_LANDSTRIP_VERSION = LANDSTRIP_VERSION.join('.');
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
 const DISCOVERY_CONNECT_TIMEOUT_MS = 250;
 
-function normalizePathForMatch(filePath: string): string {
-  return process.platform === 'win32' ? normalizePathSeparators(filePath).toLowerCase() : filePath;
-}
-
-// Component count of an absolute path; "/" is 0. Read rules use it to rank
-// matching allow and deny patterns by specificity.
-function pathDepth(absolutePath: string): number {
-  return absolutePath.split('/').filter((segment) => segment.length > 0).length;
-}
-
-// The depth of the most specific pattern that matches `filePath`, or -1 when
-// none match. A glob is anchored to the whole path, so it ranks at the path's
-// own depth; a literal pattern ranks at the depth of the prefix it covers.
-function matchDepth(filePath: string, patterns: string[], baseDirectory: string): number {
-  const abs = normalizePathForMatch(canonicalizePath(filePath, baseDirectory));
-  let depth = -1;
-
-  for (const pattern of patterns) {
-    if (/[*?[\]]/.test(pattern)) {
-      const absPattern = normalizePathForMatch(canonicalizeGlobPattern(pattern, baseDirectory));
-      if (globToRegExp(absPattern).test(abs)) depth = Math.max(depth, pathDepth(abs));
-    } else {
-      const absPattern = normalizePathForMatch(canonicalizePath(pattern, baseDirectory));
-      const separator = absPattern.endsWith('/') ? '' : '/';
-      if (abs === absPattern || abs.startsWith(absPattern + separator)) {
-        depth = Math.max(depth, pathDepth(absPattern));
-      }
-    }
-  }
-
-  return depth;
-}
-
-function resolveFilesystemPatterns(patterns: string[], baseDirectory: string): string[] {
-  return patterns.map((pattern) =>
-    /[*?[\]]/.test(pattern)
-      ? canonicalizeGlobPattern(pattern, baseDirectory)
-      : canonicalizePath(pattern, baseDirectory),
-  );
-}
-
-function resolveFilesystemConfig(
-  config: SandboxFilesystemConfig,
-  baseDirectory: string,
-): SandboxFilesystemConfig {
-  return {
-    denyRead: resolveFilesystemPatterns(config.denyRead, baseDirectory),
-    allowRead: resolveFilesystemPatterns(config.allowRead, baseDirectory),
-    allowWrite: resolveFilesystemPatterns(config.allowWrite, baseDirectory),
-    denyWrite: resolveFilesystemPatterns(config.denyWrite, baseDirectory),
-  };
-}
-
-function isDomainAllowed(domain: string, config: SandboxConfig): boolean {
-  return (
-    config.network.allowNetwork ||
-    (!domainMatchesAny(domain, config.network.deniedDomains) &&
-      domainMatchesAny(domain, config.network.allowedDomains))
-  );
-}
-
-function isReadAllowed(
-  path: string,
-  allowPatterns: string[],
-  denyPatterns: string[],
-  baseDirectory: string,
-): boolean {
-  const allowDepth = matchDepth(path, allowPatterns, baseDirectory);
-  const denyDepth = matchDepth(path, denyPatterns, baseDirectory);
-  return allowDepth >= 0 && allowDepth >= denyDepth;
-}
-
-function writeAccess(
-  path: string,
-  allowPatterns: string[],
-  denyPatterns: string[],
-  baseDirectory: string,
-): 'allow' | 'deny' | 'unlisted' {
-  if (matchDepth(path, denyPatterns, baseDirectory) >= 0) return 'deny';
-  return matchDepth(path, allowPatterns, baseDirectory) >= 0 ? 'allow' : 'unlisted';
-}
-
-function extractCandidatePaths(command: string): string[] {
-  const paths: string[] = [];
-  const tokens = command.match(/[^\s"']+|"[^"]*"|'[^']*'/g) ?? [];
-  for (const token of tokens) {
-    const clean = token.replace(/^["']|["']$/g, '').replace(/[,;]$/, '');
-    if (
-      clean.startsWith('/') ||
-      clean.startsWith('~/') ||
-      clean === '~' ||
-      clean.startsWith('./') ||
-      clean.startsWith('../')
-    ) {
-      paths.push(clean);
-    }
-  }
-  return paths;
-}
-
-function extractBlockedPath(
-  output: string,
-  baseDirectory: string,
-  command?: string,
-): string | null {
-  // bash/sh: line X: /path: Permission denied
-  let match = output.match(
-    /(?:\/bin\/bash|bash|sh): (?:line \d+: )?([^:\n]+): (?:Operation not permitted|Permission denied)/,
-  );
-  if (match?.[1]) return canonicalizePath(match[1], baseDirectory);
-
-  // ls/cat/cp: cannot open/access/stat '/path': Permission denied
-  match = output.match(
-    /^[a-zA-Z0-9_-]+: cannot (?:open|access|stat|create)(?: directory)? '?([^'\n]+?)'?(?: for (?:reading|writing))?: Permission denied$/m,
-  );
-  if (match?.[1]) return canonicalizePath(match[1], baseDirectory);
-
-  // Generic: cmd: /absolute/path: Permission denied or Operation not permitted
-  match = output.match(
-    /^[a-zA-Z0-9_-]+: (\/[^\n:]+): (?:Operation not permitted|Permission denied)$/m,
-  );
-  if (match?.[1]) return canonicalizePath(match[1], baseDirectory);
-
-  // Landstrip structured trap format carrying a denied path
-  const landstripTraps = parseLandstripTraps(output);
-  for (const trap of landstripTraps) {
-    if (trap.kind === 'filesystem') return canonicalizePath(trap.path, baseDirectory);
-  }
-
-  if (
-    landstripTraps.some((trap) => trap.kind === 'filesystem' || trap.kind === 'internal') &&
-    command
-  ) {
-    for (const candidate of extractCandidatePaths(command)) {
-      const resolved = canonicalizePath(candidate, baseDirectory);
-      return resolved;
-    }
-  }
-
-  return null;
-}
-
 function evaluateReadPermission(
   path: string,
   config: SandboxConfig,
@@ -221,13 +78,22 @@ function evaluateReadPermission(
   effectiveAllowRead: string[],
 ): SandboxPermissionDecision {
   const filePath = canonicalizePath(path, baseDirectory);
+  const decision = evaluateReadAccess(filePath, config.filesystem, {
+    baseDirectory,
+    allowReadOverrides: effectiveAllowRead,
+    requireAllowMatch: true,
+  });
 
-  // Reads are interactive, so the read tool never hard-denies: a path covered by
-  // allowRead at least as specifically as any denyRead is allowed silently;
-  // everything else asks for approval (allow once/session/persist or reject)
-  // rather than being blocked outright. denyRead still hard-applies to bash
-  // through the landstrip binary policy, which has no way to prompt.
-  if (isReadAllowed(filePath, effectiveAllowRead, config.filesystem.denyRead, baseDirectory)) {
+  if (decision === 'deny') {
+    return {
+      status: 'deny',
+      kind: 'read',
+      resource: filePath,
+      message: `Sandbox: read access denied for "${filePath}" (denyReadAlways).`,
+    };
+  }
+
+  if (decision === 'allow') {
     return { status: 'allow', kind: 'read', resource: filePath, message: '' };
   }
 
@@ -246,14 +112,21 @@ function evaluateWritePermission(
   effectiveAllowWrite: string[],
 ): SandboxPermissionDecision {
   const filePath = canonicalizePath(path, baseDirectory);
-  const access = writeAccess(
-    filePath,
-    effectiveAllowWrite,
-    config.filesystem.denyWrite,
+  const decision = evaluateWriteAccess(filePath, config.filesystem, {
     baseDirectory,
-  );
+    allowWriteOverrides: effectiveAllowWrite,
+  });
 
-  if (access === 'deny') {
+  if (decision === 'denyAlways') {
+    return {
+      status: 'deny',
+      kind: 'write',
+      resource: filePath,
+      message: `Sandbox: write access denied for "${filePath}" (denyWriteAlways).`,
+    };
+  }
+
+  if (decision === 'deny') {
     return {
       status: 'deny',
       kind: 'write',
@@ -262,7 +135,7 @@ function evaluateWritePermission(
     };
   }
 
-  if (access === 'allow') {
+  if (decision === 'allow') {
     return { status: 'allow', kind: 'write', resource: filePath, message: '' };
   }
 
@@ -278,11 +151,9 @@ function evaluateDomainPermission(
   domain: string,
   config: SandboxConfig,
 ): SandboxPermissionDecision {
-  if (config.network.allowNetwork) {
-    return { status: 'allow', kind: 'domain', resource: domain, message: '' };
-  }
+  const decision = evaluateDomainAccess(domain, config.network);
 
-  if (domainMatchesAny(domain, config.network.deniedDomains)) {
+  if (decision === 'deny') {
     return {
       status: 'deny',
       kind: 'domain',
@@ -291,7 +162,7 @@ function evaluateDomainPermission(
     };
   }
 
-  if (isDomainAllowed(domain, config)) {
+  if (decision === 'allow') {
     return { status: 'allow', kind: 'domain', resource: domain, message: '' };
   }
 
@@ -334,23 +205,6 @@ function hasMinimumVersion(version: string, minimum: readonly [number, number, n
   return true;
 }
 
-function buildLandstripPolicy(
-  config: SandboxConfig,
-  baseDirectory: string,
-  proxyPort: number | null,
-): LandstripPolicy {
-  return {
-    network: {
-      allowNetwork: config.network.allowNetwork,
-      allowLocalBinding: config.network.allowLocalBinding,
-      allowAllUnixSockets: config.network.allowAllUnixSockets,
-      allowUnixSockets: config.network.allowUnixSockets,
-      ...(proxyPort !== null ? { httpProxyPort: proxyPort } : {}),
-    },
-    filesystem: resolveFilesystemConfig(config.filesystem, baseDirectory),
-  };
-}
-
 function writePolicyFile(
   config: SandboxConfig,
   baseDirectory: string,
@@ -360,7 +214,14 @@ function writePolicyFile(
   const path = join(dir, 'policy.json');
   writeFileSync(
     path,
-    JSON.stringify(buildLandstripPolicy(config, baseDirectory, proxyPort), null, 2) + '\n',
+    serializeLandstripPolicy(
+      buildLandstripPolicy({
+        network: config.network,
+        filesystem: config.filesystem,
+        baseDirectory,
+        httpProxyPort: proxyPort,
+      }),
+    ),
   );
 
   return { dir, path };
@@ -371,19 +232,7 @@ function proxyEnv(
   proxyToken?: string | null,
 ): Record<string, string> | undefined {
   if (port === null) return undefined;
-  const credentials = proxyToken ? `landstrip:${proxyToken}@` : '';
-  const url = `http://${credentials}127.0.0.1:${port}`;
-
-  return {
-    HTTP_PROXY: url,
-    HTTPS_PROXY: url,
-    ALL_PROXY: url,
-    http_proxy: url,
-    https_proxy: url,
-    all_proxy: url,
-    NO_PROXY: '',
-    no_proxy: '',
-  };
+  return createProxyEnvironment(port, proxyToken) as Record<string, string>;
 }
 
 function shellQuote(value: string): string {
@@ -406,6 +255,8 @@ function startTrapServer(
   denyRead: string[],
   denyWrite: string[],
   baseDirectory: string,
+  denyReadAlways: string[] = [],
+  denyWriteAlways: string[] = [],
 ): Promise<{ server: ReturnType<typeof createServer>; port: number; trapLines: string[] }> {
   const trapLines: string[] = [];
   const server = createServer((trapSocket) => {
@@ -435,8 +286,16 @@ function startTrapServer(
             const operation = trap.operation;
             const allowed =
               operation === 'read'
-                ? isReadAllowed(path, effectiveAllowRead, denyRead, baseDirectory)
-                : writeAccess(path, effectiveAllowWrite, denyWrite, baseDirectory) === 'allow';
+                ? evaluateReadAccess(
+                    path,
+                    { allowRead: effectiveAllowRead, denyRead, denyReadAlways },
+                    { baseDirectory, requireAllowMatch: true },
+                  ) === 'allow'
+                : evaluateWriteAccess(
+                    path,
+                    { allowWrite: effectiveAllowWrite, denyWrite, denyWriteAlways },
+                    { baseDirectory },
+                  ) === 'allow';
             if (allowed) {
               trapSocket.write(controlResponseLine(queryId, 'allow'));
             } else {
@@ -826,16 +685,13 @@ const plugin: Plugin.Plugin = {
         }
       }
 
-      const proxyToken = allowNetwork ? null : randomBytes(32).toString('base64url');
-      const proxyAuthorization =
-        proxyToken === null
-          ? undefined
-          : `Basic ${Buffer.from(`landstrip:${proxyToken}`).toString('base64')}`;
+      const proxyCredentials = allowNetwork ? null : createProxyCredentials();
+      const proxyToken = proxyCredentials ? proxyCredentials.token : null;
       const proxy = allowNetwork
         ? null
         : await startFilterProxy({
             isDomainAllowed: (domain) => isDomainAllowed(domain, config),
-            ...(proxyAuthorization === undefined ? {} : { authorization: proxyAuthorization }),
+            ...(proxyCredentials ? { authorization: proxyCredentials.authorization } : {}),
           });
       const proxyPort = proxy ? proxy.port : null;
       let policy: { dir: string; path: string };
@@ -866,6 +722,8 @@ const plugin: Plugin.Plugin = {
               config.filesystem.denyRead,
               config.filesystem.denyWrite,
               directory,
+              config.filesystem.denyReadAlways,
+              config.filesystem.denyWriteAlways,
             )
           : null;
       const trapPort = tuiTrapPort ?? trapServer?.port ?? null;
@@ -910,11 +768,13 @@ const plugin: Plugin.Plugin = {
       const effectiveAllowWrite = config.filesystem.allowWrite;
       const args: Record<string, unknown> = { ...evaluation.metadata };
       if (action === 'read' || action === 'external_directory') args.paths = patterns;
-      if (action === 'edit') {
+      if (action === 'write' || action === 'edit') {
         args.paths =
           patterns.length > 0
             ? patterns
-            : [args.filepath].filter((path): path is string => typeof path === 'string');
+            : [args.filepath ?? args.path].filter(
+                (path): path is string => typeof path === 'string',
+              );
       }
       if ((action === 'shell' || action === 'bash') && typeof args.command !== 'string') {
         args.command = patterns[0];
@@ -1037,7 +897,7 @@ const plugin: Plugin.Plugin = {
       );
       const blockedPath = blockedTrap
         ? canonicalizePath(blockedTrap.path, directory)
-        : extractBlockedPath(outputText, directory, state.originalCommand);
+        : extractDeniedPath(outputText, { cwd: directory, command: state.originalCommand });
       if (blockedPath) {
         const blockedOperation = blockedTrap?.operation ?? 'read';
         await notifyOnce(

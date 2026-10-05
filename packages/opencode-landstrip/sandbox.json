@@ -10,6 +10,7 @@
   },
   "filesystem": {
     "denyRead": ["/Users", "/home"],
+    "denyReadAlways": [],
     "allowRead": [".", "~/.gitconfig", "~/.config/git/config", "/dev/null"],
     "allowWrite": [".", "/dev/null"],
     "denyWrite": [
@@ -19,6 +20,7 @@
       "**/*.key",
       ".opencode/sandbox.json",
       "~/.config/opencode/sandbox.json"
-    ]
+    ],
+    "denyWriteAlways": []
   }
 }

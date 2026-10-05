@@ -112,6 +112,84 @@ test('permission evaluation preserves host denials and never preapproves a domai
   );
 });
 
+test('permission evaluation hard-denies denyReadAlways and denyWriteAlways without prompting', async () => {
+  await withPlugin(
+    {
+      enabled: true,
+      filesystem: {
+        allowRead: ['.'],
+        denyRead: [],
+        denyReadAlways: ['private'],
+        allowWrite: ['.'],
+        denyWrite: ['read-only'],
+        denyWriteAlways: ['never-write'],
+      },
+      network: { allowNetwork: false, allowedDomains: [], deniedDomains: [] },
+    },
+    async ({ handlers, tempDir }) => {
+      const readAlways = {
+        action: 'read',
+        resources: [join(tempDir, 'private', 'secret.txt')],
+        effect: 'allow',
+      };
+      await handlers.permission.evaluate(readAlways);
+      assert.equal(readAlways.effect, 'deny');
+
+      const readAsk = {
+        action: 'read',
+        resources: [join(tempDir, '..', 'other.txt')],
+        effect: 'allow',
+      };
+      await handlers.permission.evaluate(readAsk);
+      assert.equal(readAsk.effect, 'ask');
+
+      const writeAlways = {
+        action: 'write',
+        resources: [join(tempDir, 'never-write', 'log.txt')],
+        effect: 'allow',
+      };
+      await handlers.permission.evaluate(writeAlways);
+      assert.equal(writeAlways.effect, 'deny');
+
+      const writeDeny = {
+        action: 'write',
+        resources: [join(tempDir, 'read-only', 'file.txt')],
+        effect: 'allow',
+      };
+      await handlers.permission.evaluate(writeDeny);
+      assert.equal(writeDeny.effect, 'deny');
+
+      const writeAllow = {
+        action: 'write',
+        resources: [join(tempDir, 'allowed.txt')],
+        effect: 'allow',
+      };
+      await handlers.permission.evaluate(writeAllow);
+      assert.equal(writeAllow.effect, 'allow');
+
+      await assert.rejects(
+        handlers.tool['execute.before']({
+          id: 'read-blocked',
+          sessionID: 'test-session',
+          tool: 'read',
+          input: { path: join(tempDir, 'private', 'secret.txt') },
+        }),
+        /denyReadAlways/,
+      );
+
+      await assert.rejects(
+        handlers.tool['execute.before']({
+          id: 'write-blocked',
+          sessionID: 'test-session',
+          tool: 'write',
+          input: { path: join(tempDir, 'never-write', 'log.txt') },
+        }),
+        /denyWriteAlways/,
+      );
+    },
+  );
+});
+
 test('proxy authenticates requests and connects to allowed private destinations', async () => {
   let connections = 0;
   const upstreamSockets = new Set();

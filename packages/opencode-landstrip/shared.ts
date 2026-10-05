@@ -2,10 +2,23 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import { binaryPath } from '@landstrip/landstrip-api';
-import { isRecord } from '@landstrip/landstrip-api/shared';
+import {
+  deepMergeSandboxConfig,
+  extractDomainsFromCommand,
+  isRecord,
+  parseSandboxConfig,
+} from '@landstrip/landstrip-api/shared';
+import type { SandboxConfig, SandboxConfigOverrides } from '@landstrip/landstrip-api/shared';
 
-export type { LandstripControlResponse, LandstripTrap } from '@landstrip/landstrip-api';
+export type {
+  LandstripControlResponse,
+  LandstripFilesystemPolicy,
+  LandstripNetworkPolicy,
+  LandstripPolicy,
+  LandstripTrap,
+} from '@landstrip/landstrip-api';
 export {
+  buildLandstripPolicy,
   allowsAllDomains,
   canonicalizeGlobPattern,
   canonicalizePath,
@@ -22,8 +35,39 @@ export {
   normalizePathSeparators,
   parseLandstripTraps,
   pathUnderDirectory,
+  resolveFilesystemPatterns,
+  resolveFilesystemPolicy,
   sessionAllows,
   sessionScopeFor,
+  serializeLandstripPolicy,
+  deepMergeSandboxConfig,
+  mergeArray,
+  parseSandboxConfig,
+  matchesPathPattern,
+  matchPathSpecificity,
+  isPathReadAllowed,
+  isPathWriteAllowed,
+  shouldPromptForWrite,
+  evaluateReadAccess,
+  evaluateWriteAccess,
+  isDomainAllowed,
+  evaluateDomainAccess,
+  extractDomainsFromCommand,
+  extractCandidatePaths,
+  extractNativeDeniedPath,
+  extractDeniedPath,
+  type PathAccessDecision,
+  type DomainAccessDecision,
+  type EvaluateReadOptions,
+  type EvaluateWriteOptions,
+  type EvaluateDomainOptions,
+  type SandboxConfig,
+  type SandboxConfigFile,
+  type SandboxConfigOverrides,
+  type SandboxFilesystemConfig,
+  type SandboxNetworkConfig,
+  type SandboxShellConfig,
+  type SandboxWindowsConfig,
 } from '@landstrip/landstrip-api/shared';
 
 import { createHash } from 'node:crypto';
@@ -31,34 +75,6 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSyn
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-
-export interface SandboxFilesystemConfig {
-  denyRead: string[];
-  allowRead: string[];
-  allowWrite: string[];
-  denyWrite: string[];
-}
-
-export interface SandboxNetworkConfig {
-  allowNetwork: boolean;
-  allowLocalBinding: boolean;
-  allowAllUnixSockets: boolean;
-  allowUnixSockets: string[];
-  allowedDomains: string[];
-  deniedDomains: string[];
-}
-
-export interface SandboxConfig {
-  enabled: boolean;
-  network: SandboxNetworkConfig;
-  filesystem: SandboxFilesystemConfig;
-}
-
-export interface SandboxConfigOverrides {
-  enabled?: boolean;
-  network?: Partial<SandboxNetworkConfig>;
-  filesystem?: Partial<SandboxFilesystemConfig>;
-}
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 
@@ -72,105 +88,8 @@ const LANDSTRIP_PACKAGE_NAMES = new Set([
   '@landstrip/landstrip-win32-arm64',
 ]);
 
-function rejectUnknownFields(
-  value: Record<string, unknown>,
-  fields: readonly string[],
-  prefix = '',
-): void {
-  for (const field of Object.keys(value)) {
-    if (!fields.includes(field)) throw new Error(`unknown sandbox field ${prefix}${field}`);
-  }
-}
-
-function booleanValue(value: unknown, field: string): boolean | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== 'boolean') throw new Error(`${field} must be a boolean`);
-  return value;
-}
-
-function stringArray(value: unknown, field: string): string[] | undefined {
-  if (value === undefined) return undefined;
-  if (!Array.isArray(value) || [...value].some((item) => typeof item !== 'string')) {
-    throw new Error(`${field} must be an array of strings`);
-  }
-  return [...value];
-}
-
-function normalizeNetworkConfig(value: unknown): Partial<SandboxNetworkConfig> | undefined {
-  if (value === undefined) return undefined;
-  if (!isRecord(value)) throw new Error('network must be an object');
-  rejectUnknownFields(
-    value,
-    [
-      'allowNetwork',
-      'allowLocalBinding',
-      'allowAllUnixSockets',
-      'allowUnixSockets',
-      'allowedDomains',
-      'deniedDomains',
-    ],
-    'network.',
-  );
-
-  const config: Partial<SandboxNetworkConfig> = {};
-  const allowNetwork = booleanValue(value.allowNetwork, 'network.allowNetwork');
-  if (allowNetwork !== undefined) config.allowNetwork = allowNetwork;
-  const allowLocalBinding = booleanValue(value.allowLocalBinding, 'network.allowLocalBinding');
-  if (allowLocalBinding !== undefined) config.allowLocalBinding = allowLocalBinding;
-  const allowAllUnixSockets = booleanValue(
-    value.allowAllUnixSockets,
-    'network.allowAllUnixSockets',
-  );
-  if (allowAllUnixSockets !== undefined) config.allowAllUnixSockets = allowAllUnixSockets;
-
-  const allowUnixSockets = stringArray(value.allowUnixSockets, 'network.allowUnixSockets');
-  if (allowUnixSockets) config.allowUnixSockets = allowUnixSockets;
-
-  const allowedDomains = stringArray(value.allowedDomains, 'network.allowedDomains');
-  if (allowedDomains) config.allowedDomains = allowedDomains;
-
-  const deniedDomains = stringArray(value.deniedDomains, 'network.deniedDomains');
-  if (deniedDomains) config.deniedDomains = deniedDomains;
-
-  return config;
-}
-
-function normalizeFilesystemConfig(value: unknown): Partial<SandboxFilesystemConfig> | undefined {
-  if (value === undefined) return undefined;
-  if (!isRecord(value)) throw new Error('filesystem must be an object');
-  rejectUnknownFields(value, ['denyRead', 'allowRead', 'allowWrite', 'denyWrite'], 'filesystem.');
-
-  const config: Partial<SandboxFilesystemConfig> = {};
-  const denyRead = stringArray(value.denyRead, 'filesystem.denyRead');
-  if (denyRead) config.denyRead = denyRead;
-
-  const allowRead = stringArray(value.allowRead, 'filesystem.allowRead');
-  if (allowRead) config.allowRead = allowRead;
-
-  const allowWrite = stringArray(value.allowWrite, 'filesystem.allowWrite');
-  if (allowWrite) config.allowWrite = allowWrite;
-
-  const denyWrite = stringArray(value.denyWrite, 'filesystem.denyWrite');
-  if (denyWrite) config.denyWrite = denyWrite;
-
-  return config;
-}
-
 export function normalizeConfig(value: unknown): SandboxConfigOverrides {
-  if (!isRecord(value)) throw new Error('sandbox config must be an object');
-  rejectUnknownFields(value, ['enabled', 'network', 'filesystem']);
-
-  const config: SandboxConfigOverrides = {};
-  const enabled = booleanValue(value.enabled, 'enabled');
-  if (enabled !== undefined) config.enabled = enabled;
-
-  const network = normalizeNetworkConfig(value.network);
-  if (network) config.network = network;
-
-  const filesystem = normalizeFilesystemConfig(value.filesystem);
-  if (filesystem) config.filesystem = filesystem;
-
-  return config;
+  return parseSandboxConfig(value);
 }
 
 export function normalizeOptions(options: unknown): SandboxConfigOverrides {
@@ -180,32 +99,8 @@ export function normalizeOptions(options: unknown): SandboxConfigOverrides {
   return normalizeConfig(options.config);
 }
 
-function mergeArray(base: string[], override?: string[]): string[] {
-  if (!override) return base;
-  return [...new Set([...base, ...override])];
-}
-
 export function deepMerge(base: SandboxConfig, overrides: SandboxConfigOverrides): SandboxConfig {
-  const network = overrides.network;
-  const filesystem = overrides.filesystem;
-
-  return {
-    enabled: overrides.enabled ?? base.enabled,
-    network: {
-      allowNetwork: network?.allowNetwork ?? base.network.allowNetwork,
-      allowLocalBinding: network?.allowLocalBinding ?? base.network.allowLocalBinding,
-      allowAllUnixSockets: network?.allowAllUnixSockets ?? base.network.allowAllUnixSockets,
-      allowUnixSockets: mergeArray(base.network.allowUnixSockets, network?.allowUnixSockets),
-      allowedDomains: mergeArray(base.network.allowedDomains, network?.allowedDomains),
-      deniedDomains: mergeArray(base.network.deniedDomains, network?.deniedDomains),
-    },
-    filesystem: {
-      denyRead: mergeArray(base.filesystem.denyRead, filesystem?.denyRead),
-      allowRead: mergeArray(base.filesystem.allowRead, filesystem?.allowRead),
-      allowWrite: mergeArray(base.filesystem.allowWrite, filesystem?.allowWrite),
-      denyWrite: mergeArray(base.filesystem.denyWrite, filesystem?.denyWrite),
-    },
-  };
+  return deepMergeSandboxConfig(base, overrides);
 }
 
 export function getConfigPaths(baseDirectory: string): { globalPath: string; projectPath: string } {
@@ -296,18 +191,6 @@ export function landstripBinaryPath(): string {
     _landstripBinaryPathError = error;
     throw error;
   }
-}
-
-export function extractDomainsFromCommand(command: string): string[] {
-  const urlRegex = /https?:\/\/([^\s/:?#'"]+)(?::\d+)?(?:[/?#]|\s|$)/g;
-  const domains = new Set<string>();
-  let match: RegExpExecArray | null;
-
-  while ((match = urlRegex.exec(command)) !== null) {
-    if (match[1]) domains.add(match[1]);
-  }
-
-  return [...domains];
 }
 
 // Permission requests reach the plugin in slightly different shapes across the

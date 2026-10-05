@@ -797,8 +797,10 @@ const tui: TuiPlugin.Definition = {
               row('Denied Domains', values(config.network.deniedDomains)),
               row('Allowed Reads', values(config.filesystem.allowRead)),
               row('Denied Reads', values(config.filesystem.denyRead)),
+              row('Always Denied Reads', values(config.filesystem.denyReadAlways)),
               row('Allowed Writes', values(config.filesystem.allowWrite)),
               row('Denied Writes', values(config.filesystem.denyWrite)),
+              row('Always Denied Writes', values(config.filesystem.denyWriteAlways)),
               row(
                 'Configuration Scope',
                 enabledManagedByOptions
