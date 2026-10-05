@@ -38,6 +38,10 @@ impl PolicyFormat {
             let resolved = deserialize_paths(paths.take()).map_err(parse_failed)?;
             *paths = Value::Array(resolved.into_iter().map(Value::String).collect());
         }
+        if let Some(paths) = value.pointer_mut("/filesystem/denyWriteAlways") {
+            let resolved = deserialize_paths(paths.take()).map_err(parse_failed)?;
+            *paths = Value::Array(resolved.into_iter().map(Value::String).collect());
+        }
         Ok(value)
     }
 }
@@ -63,6 +67,8 @@ pub(crate) struct SandboxFilesystem {
     pub(crate) deny_read: Vec<String>,
     #[serde(deserialize_with = "deserialize_paths")]
     pub(crate) deny_read_always: Vec<String>,
+    #[serde(deserialize_with = "deserialize_paths")]
+    pub(crate) deny_write_always: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

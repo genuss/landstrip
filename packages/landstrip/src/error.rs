@@ -71,6 +71,8 @@ pub(crate) enum Error {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     PolicyDenyReadAlwaysUnsupported,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    PolicyDenyWriteAlwaysUnsupported,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     PolicyLocalBindingUnsupported,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     PolicyUnixSocketUnsupported,
@@ -161,6 +163,9 @@ impl Error {
             }
             Self::PolicyDenyReadAlwaysUnsupported => {
                 Some("denyReadAlways is unsupported on Windows")
+            }
+            Self::PolicyDenyWriteAlwaysUnsupported => {
+                Some("denyWriteAlways is unsupported on Windows")
             }
             Self::PolicyLocalBindingUnsupported => {
                 Some("local binding is unsupported by the active Windows sandbox")

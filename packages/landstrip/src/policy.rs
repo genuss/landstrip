@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 pub(crate) struct AccessPolicy {
     pub(crate) write_roots: Vec<PathBuf>,
     pub(crate) write_denied_roots: Vec<PathBuf>,
+    pub(crate) write_denied_always_roots: Box<[PathBuf]>,
     pub(crate) write_denied_patterns: Vec<String>,
     pub(crate) write_denied_links: Vec<PathBuf>,
     pub(crate) read_access: ReadAccess,
@@ -293,6 +294,10 @@ pub(crate) fn resolve_policy(
     if !filesystem.deny_read_always.is_empty() {
         return Err(Error::PolicyDenyReadAlwaysUnsupported.into());
     }
+    #[cfg(target_os = "windows")]
+    if !filesystem.deny_write_always.is_empty() {
+        return Err(Error::PolicyDenyWriteAlwaysUnsupported.into());
+    }
     let home_dir = dirs::home_dir();
     let home = home_dir.as_deref();
     let policy_base = if policy_base.is_absolute() {
@@ -310,9 +315,23 @@ pub(crate) fn resolve_policy(
         .into_iter()
         .filter(|path| path.try_exists().unwrap_or(false))
         .collect::<Vec<_>>();
-    let (write_deny, write_denied_patterns) =
+    let (mut write_deny, write_denied_patterns) =
         resolve_deny_paths(&filesystem.deny_write, &policy_base, home)?;
-    let write_denied_links = collect_symlink_ancestors(&filesystem.deny_write, &policy_base, home)?;
+    let mut write_denied_links =
+        collect_symlink_ancestors(&filesystem.deny_write, &policy_base, home)?;
+    let write_denied_always_roots =
+        resolve_paths(&filesystem.deny_write_always, &policy_base, home)?;
+    let write_allow: Vec<_> = write_allow
+        .into_iter()
+        .filter(|path| !path.is_under_any(&write_denied_always_roots))
+        .collect();
+    write_deny.extend(write_denied_always_roots.iter().cloned());
+    normalize_roots(&mut write_deny);
+    let write_always_links =
+        collect_symlink_ancestors(&filesystem.deny_write_always, &policy_base, home)?;
+    write_denied_links.extend(write_always_links);
+    write_denied_links.sort_unstable();
+    write_denied_links.dedup();
 
     let read_allow = resolve_paths(&filesystem.allow_read, &policy_base, home)?;
     #[cfg(target_os = "windows")]
@@ -345,6 +364,7 @@ pub(crate) fn resolve_policy(
     let policy = AccessPolicy {
         write_roots: write_allow,
         write_denied_roots: write_deny,
+        write_denied_always_roots: write_denied_always_roots.into_boxed_slice(),
         write_denied_patterns,
         write_denied_links,
         read_access,

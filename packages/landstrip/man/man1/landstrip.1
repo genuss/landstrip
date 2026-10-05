@@ -109,6 +109,8 @@ Objects merge recursively, arrays combine without duplicates, and later scalar
 values replace earlier values.
 Executable policy is merged last.
 .Va denyReadAlways
+and
+.Va denyWriteAlways
 roots accumulate across documents, including newline-string lists;
 empty lists and null values cannot remove earlier roots.
 .Pp
@@ -118,6 +120,7 @@ Example fields (platform limits are described below):
   "filesystem": {
     "allowWrite": ["."],
     "denyWrite": ["**/.env"],
+    "denyWriteAlways": ["~/vault/secrets"],
     "denyRead": ["~/.ssh"],
     "denyReadAlways": ["~/.config/agent/auth.json"],
     "allowRead": ["~/.ssh/config"]
@@ -144,7 +147,9 @@ Writes are denied by default.
 .Va allowWrite
 grants writable roots and
 .Va denyWrite
-always takes precedence.
+always takes precedence, and
+.Va denyWriteAlways
+roots cannot be overridden by any allow or broker approval.
 Reads default to unrestricted on Linux and macOS.
 .Va allowRead
 adds exceptions to
@@ -177,6 +182,8 @@ platform escape-prevention rules remain active.
 .Ss Windows
 Windows requires an explicit read allowlist and rejects nonempty
 .Va denyReadAlways
+and
+.Va denyWriteAlways
 before path resolution, even for missing paths or unmatched globs.
 .Va windows.appContainerMode
 selects

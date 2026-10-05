@@ -1833,7 +1833,8 @@ fn handle_openat(
     let reports_write = flags & (libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) != 0;
     let wants_read = flags & libc::O_WRONLY == 0;
     let hard_read_denied = wants_read && resolved.is_under_any(&policy.read_denied_always_roots);
-    let query_enabled = query_enabled && !hard_read_denied;
+    let hard_write_denied = wants_write && resolved.is_under_any(&policy.write_denied_always_roots);
+    let query_enabled = query_enabled && !hard_read_denied && !hard_write_denied;
 
     if wants_write && !hard_read_denied {
         let lexical = normalize_path_lexically(&raw);
@@ -2350,9 +2351,22 @@ fn handle_mutation(
             })
         })
         .flatten();
-    let query_enabled = query_enabled && hard_read_denial.is_none();
+    let hard_write_denial = slots.iter().position(|slot| {
+        slot.as_ref().is_some_and(|(path, _)| {
+            path.is_under_any(&policy.write_denied_always_roots)
+                || (spec.kind.is_reparent()
+                    && policy
+                        .write_denied_always_roots
+                        .iter()
+                        .any(|root| root.is_under(path)))
+        })
+    });
+    let query_enabled = query_enabled && hard_read_denial.is_none() && hard_write_denial.is_none();
     denial = hard_read_denial
         .map(|index| (index, DenialReason::DenyMatch, TrapOperation::Read))
+        .or_else(|| {
+            hard_write_denial.map(|index| (index, DenialReason::DenyMatch, TrapOperation::Write))
+        })
         .or(denial)
         .or_else(|| reparent_read_denial(policy, spec, &slots));
 
@@ -2498,6 +2512,8 @@ fn handle_fd_mutation(
         normalize_path(&requested_path)
     };
     let lexical = normalize_path_lexically(&requested_path);
+    let hard_write_denied = resolved.is_under_any(&policy.write_denied_always_roots);
+    let query_enabled = query_enabled && !hard_write_denied;
     let reason = policy.write_reason(&resolved, &lexical, true);
     let operation = MutationGrant {
         op: MutationOp::Fd { target, mutation },
@@ -2914,6 +2930,12 @@ fn grant_open(policy: &AccessPolicy, notify_fd: BorrowedFd<'_>, id: u64, grant: 
         if grant.flags & libc::O_WRONLY == 0
             && !policy.read_denied_always_roots.is_empty()
             && open_fd_path(fd.as_fd())?.is_under_any(&policy.read_denied_always_roots)
+        {
+            return Err(libc::EACCES);
+        }
+        if grant.flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0
+            && !policy.write_denied_always_roots.is_empty()
+            && open_fd_path(fd.as_fd())?.is_under_any(&policy.write_denied_always_roots)
         {
             return Err(libc::EACCES);
         }
