@@ -105,7 +105,7 @@ fn inspect_policy(command: &PolicyCommand) -> Result<CommandOutcome> {
         }
         PolicyCommand::Resolve(request) => {
             let policy = load_policy(&request.policy, request.tool.as_deref())?;
-            Ok(CommandOutcome::PolicyResolved(policy))
+            Ok(CommandOutcome::PolicyResolved(Box::new(policy)))
         }
     }
 }

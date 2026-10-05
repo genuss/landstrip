@@ -123,7 +123,7 @@ impl WindowsStatusReport {
 pub(crate) enum CommandOutcome {
     Exit(i32),
     PolicyValidated(PolicyValidationReport),
-    PolicyResolved(AccessPolicy),
+    PolicyResolved(Box<AccessPolicy>),
     Doctor(DoctorReport),
     #[cfg(target_os = "windows")]
     Windows(WindowsStatusReport),
