@@ -633,6 +633,172 @@ function deepMergeSandboxConfig(base, overrides) {
 }
 
 
+function normalizePathForComparison(filePath) {
+  const normalized = normalizePathSeparators(filePath);
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function matchesPathPattern(filePath, patterns, baseDirectory = process.cwd()) {
+  if (!Array.isArray(patterns) || patterns.length === 0) return false;
+  const abs = normalizePathForComparison(canonicalizePath(filePath, baseDirectory));
+
+  return patterns.some((pattern) => {
+    const absPattern = normalizePathForComparison(canonicalizeGlobPattern(pattern, baseDirectory));
+
+    if (/[*?[\]]/.test(pattern)) {
+      const matcher = globToRegExp(absPattern);
+      for (let candidate = abs; ;) {
+        if (matcher.test(candidate)) return true;
+        const parent = normalizePathSeparators(dirname(candidate));
+        if (parent === candidate) break;
+        candidate = process.platform === 'win32' ? parent.toLowerCase() : parent;
+      }
+      return false;
+    }
+
+    const sepChar = absPattern.endsWith('/') ? '' : '/';
+    return abs === absPattern || abs.startsWith(absPattern + sepChar);
+  });
+}
+
+function matchPathSpecificity(filePath, patterns, baseDirectory = process.cwd()) {
+  if (!Array.isArray(patterns) || patterns.length === 0) return -1;
+  let best = -1;
+  for (const pattern of patterns) {
+    if (!matchesPathPattern(filePath, [pattern], baseDirectory)) continue;
+    const canonical = canonicalizeGlobPattern(pattern, baseDirectory);
+    if (canonical.length > best) {
+      best = canonical.length;
+    }
+  }
+  return best;
+}
+
+function isPathReadAllowed(
+  filePath,
+  allowRead,
+  denyRead,
+  baseDirectory = process.cwd(),
+  options,
+) {
+  const allowPatterns = Array.isArray(allowRead) ? allowRead : [];
+  const denyPatterns = Array.isArray(denyRead) ? denyRead : [];
+  const allow = matchPathSpecificity(filePath, allowPatterns, baseDirectory);
+  const deny = matchPathSpecificity(filePath, denyPatterns, baseDirectory);
+
+  if (options && options.requireAllowMatch) {
+    return allow >= 0 && allow >= deny;
+  }
+  if (deny < 0) return true;
+  return allow >= deny;
+}
+
+function isPathWriteAllowed(filePath, allowWrite, baseDirectory = process.cwd()) {
+  const allowPatterns = Array.isArray(allowWrite) ? allowWrite : [];
+  return allowPatterns.length > 0 && matchesPathPattern(filePath, allowPatterns, baseDirectory);
+}
+
+function shouldPromptForWrite(filePath, allowWrite, baseDirectory = process.cwd()) {
+  return !isPathWriteAllowed(filePath, allowWrite, baseDirectory);
+}
+
+function normalizeReadOptions(options, allowReadOverrides) {
+  if (typeof options === 'string') {
+    return {
+      baseDirectory: options,
+      allowReadOverrides: Array.isArray(allowReadOverrides) ? allowReadOverrides : [],
+      requireAllowMatch: false,
+    };
+  }
+  return {
+    baseDirectory: options?.baseDirectory,
+    allowReadOverrides: options?.allowReadOverrides ?? (Array.isArray(allowReadOverrides) ? allowReadOverrides : []),
+    requireAllowMatch: options?.requireAllowMatch ?? false,
+  };
+}
+
+function evaluateReadAccess(filePath, filesystemOrConfig, options, allowReadOverrides) {
+  const filesystem = filesystemOrConfig && 'filesystem' in filesystemOrConfig ? filesystemOrConfig.filesystem : (filesystemOrConfig ?? {});
+  const opts = normalizeReadOptions(options, allowReadOverrides);
+  const baseDirectory = opts.baseDirectory;
+
+  if (filesystem.denyReadAlways && matchesPathPattern(filePath, filesystem.denyReadAlways, baseDirectory)) {
+    return 'deny';
+  }
+
+  const effectiveAllowRead = opts.allowReadOverrides.length > 0
+    ? mergeArray(filesystem.allowRead ?? [], opts.allowReadOverrides)
+    : (filesystem.allowRead ?? []);
+
+  if (isPathReadAllowed(filePath, effectiveAllowRead, filesystem.denyRead ?? [], baseDirectory, { requireAllowMatch: opts.requireAllowMatch })) {
+    return 'allow';
+  }
+
+  return 'ask';
+}
+
+function normalizeWriteOptions(options, allowWriteOverrides) {
+  if (typeof options === 'string') {
+    return {
+      baseDirectory: options,
+      allowWriteOverrides: Array.isArray(allowWriteOverrides) ? allowWriteOverrides : [],
+    };
+  }
+  return {
+    baseDirectory: options?.baseDirectory,
+    allowWriteOverrides: options?.allowWriteOverrides ?? (Array.isArray(allowWriteOverrides) ? allowWriteOverrides : []),
+  };
+}
+
+function evaluateWriteAccess(filePath, filesystemOrConfig, options, allowWriteOverrides) {
+  const filesystem = filesystemOrConfig && 'filesystem' in filesystemOrConfig ? filesystemOrConfig.filesystem : (filesystemOrConfig ?? {});
+  const opts = normalizeWriteOptions(options, allowWriteOverrides);
+  const baseDirectory = opts.baseDirectory;
+
+  if (filesystem.denyWriteAlways && matchesPathPattern(filePath, filesystem.denyWriteAlways, baseDirectory)) {
+    return 'denyAlways';
+  }
+
+  if (filesystem.denyWrite && matchesPathPattern(filePath, filesystem.denyWrite, baseDirectory)) {
+    return 'deny';
+  }
+
+  const effectiveAllowWrite = opts.allowWriteOverrides.length > 0
+    ? mergeArray(filesystem.allowWrite ?? [], opts.allowWriteOverrides)
+    : (filesystem.allowWrite ?? []);
+
+  if (effectiveAllowWrite.length > 0 && matchesPathPattern(filePath, effectiveAllowWrite, baseDirectory)) {
+    return 'allow';
+  }
+
+  return 'ask';
+}
+
+function isDomainAllowed(domain, networkOrConfig, allowedDomainsOverrides) {
+  const network = networkOrConfig && 'network' in networkOrConfig ? networkOrConfig.network : (networkOrConfig ?? {});
+  if (network.allowNetwork) return true;
+  const denied = network.deniedDomains ?? [];
+  if (domainMatchesAny(domain, denied)) return false;
+  const effectiveAllowed = Array.isArray(allowedDomainsOverrides) && allowedDomainsOverrides.length > 0
+    ? mergeArray(network.allowedDomains ?? [], allowedDomainsOverrides)
+    : (network.allowedDomains ?? []);
+  return domainMatchesAny(domain, effectiveAllowed);
+}
+
+function evaluateDomainAccess(domain, networkOrConfig, options) {
+  const network = networkOrConfig && 'network' in networkOrConfig ? networkOrConfig.network : (networkOrConfig ?? {});
+  if (network.allowNetwork) return 'allow';
+  const overrides = Array.isArray(options) ? options : options?.allowedDomainsOverrides;
+  const denied = network.deniedDomains ?? [];
+  if (domainMatchesAny(domain, denied)) return 'deny';
+  const effectiveAllowed = Array.isArray(overrides) && overrides.length > 0
+    ? mergeArray(network.allowedDomains ?? [], overrides)
+    : (network.allowedDomains ?? []);
+  if (domainMatchesAny(domain, effectiveAllowed)) return 'allow';
+  return 'ask';
+}
+
+
 module.exports = {
   isRecord,
   expandHomePath,
@@ -664,5 +830,16 @@ module.exports = {
   mergeArray,
   parseSandboxConfig,
   deepMergeSandboxConfig,
+
+  normalizePathForComparison,
+  matchesPathPattern,
+  matchPathSpecificity,
+  isPathReadAllowed,
+  isPathWriteAllowed,
+  shouldPromptForWrite,
+  evaluateReadAccess,
+  evaluateWriteAccess,
+  isDomainAllowed,
+  evaluateDomainAccess,
 
 };

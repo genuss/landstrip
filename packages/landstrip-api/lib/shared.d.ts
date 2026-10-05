@@ -124,3 +124,81 @@ export function deepMergeSandboxConfig<T extends SandboxConfig = SandboxConfig>(
   base: T,
   overrides?: SandboxConfigFile,
 ): T;
+
+
+export type PathAccessDecision = 'allow' | 'ask' | 'deny' | 'denyAlways';
+
+export type DomainAccessDecision = 'allow' | 'ask' | 'deny';
+
+export interface EvaluateReadOptions {
+  baseDirectory?: string;
+  allowReadOverrides?: string[];
+  requireAllowMatch?: boolean;
+}
+
+export interface EvaluateWriteOptions {
+  baseDirectory?: string;
+  allowWriteOverrides?: string[];
+}
+
+export interface EvaluateDomainOptions {
+  allowedDomainsOverrides?: string[];
+}
+
+export function matchesPathPattern(
+  filePath: string,
+  patterns: string[],
+  baseDirectory?: string,
+): boolean;
+
+export function matchPathSpecificity(
+  filePath: string,
+  patterns: string[],
+  baseDirectory?: string,
+): number;
+
+export function isPathReadAllowed(
+  filePath: string,
+  allowRead: string[],
+  denyRead: string[],
+  baseDirectory?: string,
+  options?: { requireAllowMatch?: boolean },
+): boolean;
+
+export function isPathWriteAllowed(
+  filePath: string,
+  allowWrite: string[],
+  baseDirectory?: string,
+): boolean;
+
+export function shouldPromptForWrite(
+  filePath: string,
+  allowWrite: string[],
+  baseDirectory?: string,
+): boolean;
+
+export function evaluateReadAccess(
+  filePath: string,
+  filesystem: SandboxFilesystemConfig | SandboxFilesystemConfigFile | SandboxConfig | SandboxConfigFile,
+  options?: EvaluateReadOptions | string,
+  allowReadOverrides?: string[],
+): 'allow' | 'ask' | 'deny';
+
+export function evaluateWriteAccess(
+  filePath: string,
+  filesystem: SandboxFilesystemConfig | SandboxFilesystemConfigFile | SandboxConfig | SandboxConfigFile,
+  options?: EvaluateWriteOptions | string,
+  allowWriteOverrides?: string[],
+): PathAccessDecision;
+
+export function isDomainAllowed(
+  domain: string,
+  network: SandboxNetworkConfig | SandboxNetworkConfigFile | SandboxConfig | SandboxConfigFile,
+  allowedDomainsOverrides?: string[],
+): boolean;
+
+export function evaluateDomainAccess(
+  domain: string,
+  network: SandboxNetworkConfig | SandboxNetworkConfigFile | SandboxConfig | SandboxConfigFile,
+  options?: EvaluateDomainOptions | string[],
+): DomainAccessDecision;
