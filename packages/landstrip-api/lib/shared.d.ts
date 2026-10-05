@@ -202,3 +202,30 @@ export function evaluateDomainAccess(
   network: SandboxNetworkConfig | SandboxNetworkConfigFile | SandboxConfig | SandboxConfigFile,
   options?: EvaluateDomainOptions | string[],
 ): DomainAccessDecision;
+
+
+export function normalizeBlockedPath(filePath: string, cwd?: string): string;
+
+export function extractTrapBlockedPath(
+  trapOutput: string,
+  cwd?: string,
+  operation?: 'read' | 'write',
+): string | null;
+export function extractDomainsFromCommand(command: string): string[];
+
+export function extractCandidatePaths(command: string): string[];
+
+export function extractNativeDeniedPath(output: string, cwd?: string): string | null;
+
+export function extractNativeWriteDeniedPath(output: string, cwd?: string): string | null;
+
+export interface ExtractDeniedPathOptions {
+  cwd?: string;
+  command?: string;
+}
+
+export function extractDeniedPath(
+  output: string,
+  options?: ExtractDeniedPathOptions | string,
+  command?: string,
+): string | null;

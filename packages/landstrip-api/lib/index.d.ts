@@ -246,6 +246,10 @@ export interface EvaluateDomainOptions {
 }
 
 
+export interface ExtractDeniedPathOptions {
+  cwd?: string;
+  command?: string;
+}
 /**
  * Path to the native landstrip binary for the running platform.
  *

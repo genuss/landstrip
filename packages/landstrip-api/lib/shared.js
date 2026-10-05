@@ -799,6 +799,183 @@ function evaluateDomainAccess(domain, networkOrConfig, options) {
 }
 
 
+function isPathLike(value) {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  return (
+    trimmed === '~' ||
+    trimmed.startsWith('/') ||
+    trimmed.startsWith('\\\\') ||
+    /^[a-zA-Z]:[\\/]/.test(trimmed) ||
+    trimmed.startsWith('~/') ||
+    trimmed.startsWith('~\\') ||
+    trimmed.startsWith('./') ||
+    trimmed.startsWith('.\\') ||
+    trimmed.startsWith('../') ||
+    trimmed.startsWith('..\\') ||
+    trimmed.startsWith('.') ||
+    trimmed.includes('/') ||
+    trimmed.includes('\\')
+  );
+}
+
+function normalizeBlockedPath(filePath, cwd = process.cwd()) {
+  const nativePath =
+    process.platform === 'win32' && /^\/[a-zA-Z](?:\/|$)/.test(filePath)
+      ? `${filePath[1]}:${filePath.slice(2)}`
+      : filePath;
+  return canonicalizePath(isAbsolute(nativePath) ? nativePath : join(cwd, nativePath), cwd);
+}
+
+function normalizePathMatch(value, cwd) {
+  return isPathLike(value) ? normalizeBlockedPath(value, cwd) : null;
+}
+
+function extractDomainsFromCommand(command) {
+  if (typeof command !== 'string') return [];
+  const domains = [];
+  const urlRegex = /https?:\/\/([^\s/:?#'"]+)(?::\d+)?(?:[/?#]|\s|$)/g;
+  let match;
+  while ((match = urlRegex.exec(command)) !== null) {
+    const domain = match[1].toLowerCase();
+    if (!domains.includes(domain)) {
+      domains.push(domain);
+    }
+  }
+  return domains;
+}
+
+function extractCandidatePaths(command) {
+  if (typeof command !== 'string') return [];
+  const paths = [];
+  const tokens = command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
+  for (const rawToken of tokens) {
+    const token = rawToken.replace(/^["']|["']$/g, '');
+    const clean = token.replace(/^[<>&|;]+|[<>&|;]+$/g, '');
+    if (
+      clean.length > 0 &&
+      !clean.startsWith('-') &&
+      (clean.startsWith('/') ||
+        clean.startsWith('./') ||
+        clean.startsWith('../') ||
+        clean.startsWith('~/') ||
+        clean.startsWith('\\\\') ||
+        clean.startsWith('~\\') ||
+        clean.startsWith('.\\') ||
+        clean.startsWith('..\\') ||
+        /^[a-zA-Z]:[\\/]/.test(clean))
+    ) {
+      if (!paths.includes(clean)) {
+        paths.push(clean);
+      }
+    }
+  }
+  return paths;
+}
+
+function extractNativeDeniedPath(output, cwd = process.cwd()) {
+  if (typeof output !== 'string') return null;
+  const denial = String.raw`(?:Access is denied\.?|Operation not permitted|Permission denied)`;
+  let match = output.match(new RegExp(String.raw`['"]([^'"\n]+)['"][^\r\n]{0,120}${denial}`, 'i'));
+  if (match) return normalizePathMatch(match[1], cwd);
+
+  // bash/sh and native Windows tools: line X: /path: Permission denied,
+  // or cmd: C:\path: Access is denied.
+  match = output.match(
+    new RegExp(
+      String.raw`(?:^|:\s+)((?:[a-zA-Z]:[\\/]|\\\\|/|\.{1,2}[\\/])[^:\r\n]*?):\s+${denial}$`,
+      'im',
+    ),
+  );
+  if (match) return normalizePathMatch(match[1], cwd);
+
+  // ls/cat/cp: cannot open/access/stat '/path': Permission denied
+  match = output.match(
+    new RegExp(
+      String.raw`^[a-zA-Z0-9_-]+: cannot (?:open|access|stat|create)(?: directory)? '?([^'\n]+?)'?(?: for (?:reading|writing))?: ${denial}$`,
+      'im',
+    ),
+  );
+  if (match) return normalizePathMatch(match[1], cwd);
+
+  return null;
+}
+
+function extractNativeWriteDeniedPath(output, cwd = process.cwd()) {
+  if (typeof output !== 'string') return null;
+  const denial = String.raw`(?:Access is denied\.?|Operation not permitted|Permission denied)`;
+  let match = output.match(
+    new RegExp(
+      String.raw`(?:[Uu]nable to create|failed to create(?: directory)?|cannot (?:create|touch|mkdir|remove|unlink|rename)|for writing)[^'"\x60\r\n]*['"\x60]([^'"\x60\r\n]+)['"\x60](?:[^\r\n]*\r?\n){0,3}[^\r\n]{0,120}${denial}`,
+      'im',
+    ),
+  );
+  if (match) return normalizePathMatch(match[1], cwd);
+
+  match = output.match(
+    new RegExp(
+      String.raw`^[a-zA-Z0-9_-]+: cannot create(?: directory)? '?([^'\n]+?)'?(?: for writing)?: ${denial}$`,
+      'im',
+    ),
+  );
+  if (match) return normalizePathMatch(match[1], cwd);
+
+
+  match = output.match(
+    new RegExp(
+      String.raw`^[a-zA-Z0-9_-]+: couldn't open temporary file ((?:[a-zA-Z]:[\\/]|\\\\|/)[^:\r\n]*?): ${denial}$`,
+      'im',
+    ),
+  );
+  if (match) return normalizePathMatch(match[1], cwd);
+
+  return null;
+}
+
+function extractTrapBlockedPath(trapOutput, cwd = process.cwd(), operation) {
+  if (typeof trapOutput !== 'string') return null;
+  const traps = parseLandstripTraps(trapOutput);
+  for (const trap of traps) {
+    if (isFilesystemTrap(trap) && (!operation || trap.operation === operation)) {
+      return normalizeBlockedPath(trap.path, cwd);
+    }
+  }
+  return null;
+}
+
+function extractDeniedPath(output, options, commandArg) {
+  if (typeof output !== 'string') return null;
+  let cwd = process.cwd();
+  let command = commandArg;
+  if (typeof options === 'string') {
+    cwd = options;
+  } else if (options && typeof options === 'object') {
+    if (typeof options.cwd === 'string') cwd = options.cwd;
+    if (typeof options.command === 'string') command = options.command;
+  }
+
+  // 1. Structured traps
+  const landstripTraps = parseLandstripTraps(output);
+  const trapped = extractTrapBlockedPath(output, cwd);
+  if (trapped) return trapped;
+
+  // 2. Native shell/tool error messages
+  const nativeMatch = extractNativeDeniedPath(output, cwd);
+  if (nativeMatch) return nativeMatch;
+
+  // 3. Fallback: if landstrip trapped but path wasn't specified, inspect command candidates
+  if (
+    command &&
+    landstripTraps.some((trap) => trap.kind === 'filesystem' || trap.kind === 'internal')
+  ) {
+    for (const candidate of extractCandidatePaths(command)) {
+      return normalizeBlockedPath(candidate, cwd);
+    }
+  }
+
+  return null;
+}
+
 module.exports = {
   isRecord,
   expandHomePath,
@@ -842,4 +1019,11 @@ module.exports = {
   isDomainAllowed,
   evaluateDomainAccess,
 
+  normalizeBlockedPath,
+  extractTrapBlockedPath,
+  extractDomainsFromCommand,
+  extractCandidatePaths,
+  extractNativeDeniedPath,
+  extractNativeWriteDeniedPath,
+  extractDeniedPath,
 };
