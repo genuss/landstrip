@@ -347,6 +347,292 @@ function controlResponseLine(queryId, action) {
   return JSON.stringify({ query_id: queryId, action }) + '\n';
 }
 
+function resolveFilesystemPatterns(patterns, baseDirectory) {
+  if (!patterns || !Array.isArray(patterns)) return [];
+  if (!baseDirectory) return [...patterns];
+  return patterns.map((pattern) =>
+    /[*?[\]]/.test(pattern)
+      ? canonicalizeGlobPattern(pattern, baseDirectory)
+      : canonicalizePath(pattern, baseDirectory),
+  );
+}
+
+function resolveFilesystemPolicy(filesystem, baseDirectory) {
+  if (!filesystem) return {};
+  const resolved = {};
+  if (filesystem.denyRead !== undefined) {
+    resolved.denyRead = resolveFilesystemPatterns(filesystem.denyRead, baseDirectory);
+  }
+  if (filesystem.denyReadAlways !== undefined) {
+    resolved.denyReadAlways = resolveFilesystemPatterns(filesystem.denyReadAlways, baseDirectory);
+  }
+  if (filesystem.allowRead !== undefined) {
+    resolved.allowRead = resolveFilesystemPatterns(filesystem.allowRead, baseDirectory);
+  }
+  if (filesystem.allowWrite !== undefined) {
+    resolved.allowWrite = resolveFilesystemPatterns(filesystem.allowWrite, baseDirectory);
+  }
+  if (filesystem.denyWrite !== undefined) {
+    resolved.denyWrite = resolveFilesystemPatterns(filesystem.denyWrite, baseDirectory);
+  }
+  if (filesystem.denyWriteAlways !== undefined) {
+    resolved.denyWriteAlways = resolveFilesystemPatterns(filesystem.denyWriteAlways, baseDirectory);
+  }
+  return resolved;
+}
+
+function buildLandstripPolicy(options) {
+  const policy = {};
+  if (options.network) {
+    const net = {
+      allowNetwork: Boolean(options.network.allowNetwork),
+      allowLocalBinding: Boolean(options.network.allowLocalBinding),
+      allowAllUnixSockets: Boolean(options.network.allowAllUnixSockets),
+      allowUnixSockets: Array.isArray(options.network.allowUnixSockets)
+        ? [...options.network.allowUnixSockets]
+        : [],
+    };
+    const httpProxyPort =
+      options.httpProxyPort !== undefined
+        ? options.httpProxyPort
+        : options.network.httpProxyPort;
+    if (httpProxyPort !== null && httpProxyPort !== undefined) {
+      net.httpProxyPort = httpProxyPort;
+    }
+    const socksProxyPort =
+      options.socksProxyPort !== undefined
+        ? options.socksProxyPort
+        : options.network.socksProxyPort;
+    if (socksProxyPort !== null && socksProxyPort !== undefined) {
+      net.socksProxyPort = socksProxyPort;
+    }
+    policy.network = net;
+  }
+  if (options.filesystem) {
+    policy.filesystem = resolveFilesystemPolicy(
+      options.filesystem,
+      options.baseDirectory,
+    );
+  }
+  if (options.windows) {
+    policy.windows = {
+      appContainerMode: options.windows.appContainerMode ?? 'lpac',
+      allowLoopback: Boolean(options.windows.allowLoopback),
+    };
+  }
+  return policy;
+}
+
+function serializeLandstripPolicy(policy) {
+  return JSON.stringify(policy, null, 2) + '\n';
+}
+
+function requireSandboxObject(value, label) {
+  if (!isRecord(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+}
+
+function rejectUnknownSandboxFields(value, allowed, prefix = '') {
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) {
+      throw new Error(`unknown sandbox field ${prefix}${key}`);
+    }
+  }
+}
+
+function validateBooleanFields(value, fields, prefix = '') {
+  for (const field of fields) {
+    if (value[field] !== undefined && typeof value[field] !== 'boolean') {
+      throw new Error(`${prefix}${field} must be a boolean`);
+    }
+  }
+}
+
+function validateStringArrayFields(value, fields, prefix = '') {
+  for (const field of fields) {
+    const entry = value[field];
+    if (entry === undefined) continue;
+    if (!Array.isArray(entry) || entry.some((item) => typeof item !== 'string')) {
+      throw new Error(`${prefix}${field} must be an array of strings`);
+    }
+  }
+}
+
+function mergeArray(base, override) {
+  if (!override) return base;
+  return [...new Set([...(base ?? []), ...override])];
+}
+
+function parseSandboxConfig(value) {
+  requireSandboxObject(value, 'sandbox config');
+  rejectUnknownSandboxFields(value, ['enabled', 'shell', 'network', 'filesystem', 'windows']);
+  validateBooleanFields(value, ['enabled']);
+
+  const config = {};
+  if (value.enabled !== undefined) {
+    config.enabled = value.enabled;
+  }
+
+  if (value.shell !== undefined) {
+    requireSandboxObject(value.shell, 'shell');
+    rejectUnknownSandboxFields(value.shell, ['readAccess'], 'shell.');
+    if (
+      value.shell.readAccess !== undefined &&
+      value.shell.readAccess !== 'host' &&
+      value.shell.readAccess !== 'policy'
+    ) {
+      throw new Error('shell.readAccess must be host or policy');
+    }
+    config.shell = { ...value.shell };
+  }
+
+  if (value.network !== undefined) {
+    requireSandboxObject(value.network, 'network');
+    rejectUnknownSandboxFields(
+      value.network,
+      [
+        'allowNetwork',
+        'allowLocalBinding',
+        'allowAllUnixSockets',
+        'allowUnixSockets',
+        'allowedDomains',
+        'deniedDomains',
+      ],
+      'network.',
+    );
+    validateBooleanFields(
+      value.network,
+      ['allowNetwork', 'allowLocalBinding', 'allowAllUnixSockets'],
+      'network.',
+    );
+    validateStringArrayFields(
+      value.network,
+      ['allowUnixSockets', 'allowedDomains', 'deniedDomains'],
+      'network.',
+    );
+    config.network = {};
+    if (value.network.allowNetwork !== undefined) {
+      config.network.allowNetwork = value.network.allowNetwork;
+    }
+    if (value.network.allowLocalBinding !== undefined) {
+      config.network.allowLocalBinding = value.network.allowLocalBinding;
+    }
+    if (value.network.allowAllUnixSockets !== undefined) {
+      config.network.allowAllUnixSockets = value.network.allowAllUnixSockets;
+    }
+    if (value.network.allowUnixSockets !== undefined) {
+      config.network.allowUnixSockets = [...value.network.allowUnixSockets];
+    }
+    if (value.network.allowedDomains !== undefined) {
+      config.network.allowedDomains = [...value.network.allowedDomains];
+    }
+    if (value.network.deniedDomains !== undefined) {
+      config.network.deniedDomains = [...value.network.deniedDomains];
+    }
+  }
+
+  if (value.filesystem !== undefined) {
+    requireSandboxObject(value.filesystem, 'filesystem');
+    rejectUnknownSandboxFields(
+      value.filesystem,
+      ['denyRead', 'denyReadAlways', 'allowRead', 'allowWrite', 'denyWrite', 'denyWriteAlways'],
+      'filesystem.',
+    );
+    validateStringArrayFields(
+      value.filesystem,
+      ['denyRead', 'denyReadAlways', 'allowRead', 'allowWrite', 'denyWrite', 'denyWriteAlways'],
+      'filesystem.',
+    );
+    config.filesystem = {};
+    if (value.filesystem.denyRead !== undefined) {
+      config.filesystem.denyRead = [...value.filesystem.denyRead];
+    }
+    if (value.filesystem.denyReadAlways !== undefined) {
+      config.filesystem.denyReadAlways = [...value.filesystem.denyReadAlways];
+    }
+    if (value.filesystem.allowRead !== undefined) {
+      config.filesystem.allowRead = [...value.filesystem.allowRead];
+    }
+    if (value.filesystem.allowWrite !== undefined) {
+      config.filesystem.allowWrite = [...value.filesystem.allowWrite];
+    }
+    if (value.filesystem.denyWrite !== undefined) {
+      config.filesystem.denyWrite = [...value.filesystem.denyWrite];
+    }
+    if (value.filesystem.denyWriteAlways !== undefined) {
+      config.filesystem.denyWriteAlways = [...value.filesystem.denyWriteAlways];
+    }
+  }
+
+  if (value.windows !== undefined) {
+    requireSandboxObject(value.windows, 'windows');
+    rejectUnknownSandboxFields(value.windows, ['appContainerMode', 'allowLoopback'], 'windows.');
+    if (
+      value.windows.appContainerMode !== undefined &&
+      value.windows.appContainerMode !== 'standard' &&
+      value.windows.appContainerMode !== 'lpac'
+    ) {
+      throw new Error('windows.appContainerMode must be lpac or standard');
+    }
+    validateBooleanFields(value.windows, ['allowLoopback'], 'windows.');
+    config.windows = {};
+    if (value.windows.appContainerMode !== undefined) {
+      config.windows.appContainerMode = value.windows.appContainerMode;
+    }
+    if (value.windows.allowLoopback !== undefined) {
+      config.windows.allowLoopback = value.windows.allowLoopback;
+    }
+  }
+
+  return config;
+}
+
+function deepMergeSandboxConfig(base, overrides) {
+  if (!overrides) return { ...base };
+
+  const shell = overrides.shell;
+  const network = overrides.network;
+  const filesystem = overrides.filesystem;
+  const windows = overrides.windows;
+
+  const result = {
+    enabled: overrides.enabled ?? base.enabled,
+    network: {
+      allowNetwork: network?.allowNetwork ?? base.network?.allowNetwork ?? false,
+      allowLocalBinding: network?.allowLocalBinding ?? base.network?.allowLocalBinding ?? false,
+      allowAllUnixSockets: network?.allowAllUnixSockets ?? base.network?.allowAllUnixSockets ?? false,
+      allowUnixSockets: mergeArray(base.network?.allowUnixSockets, network?.allowUnixSockets),
+      allowedDomains: mergeArray(base.network?.allowedDomains, network?.allowedDomains),
+      deniedDomains: mergeArray(base.network?.deniedDomains, network?.deniedDomains),
+    },
+    filesystem: {
+      denyRead: mergeArray(base.filesystem?.denyRead, filesystem?.denyRead),
+      denyReadAlways: mergeArray(base.filesystem?.denyReadAlways, filesystem?.denyReadAlways),
+      allowRead: mergeArray(base.filesystem?.allowRead, filesystem?.allowRead),
+      allowWrite: mergeArray(base.filesystem?.allowWrite, filesystem?.allowWrite),
+      denyWrite: mergeArray(base.filesystem?.denyWrite, filesystem?.denyWrite),
+      denyWriteAlways: mergeArray(base.filesystem?.denyWriteAlways, filesystem?.denyWriteAlways),
+    },
+  };
+
+  if (base.shell !== undefined || shell !== undefined) {
+    result.shell = {
+      readAccess: shell?.readAccess ?? base.shell?.readAccess ?? 'host',
+    };
+  }
+
+  if (base.windows !== undefined || windows !== undefined) {
+    result.windows = {
+      appContainerMode: windows?.appContainerMode ?? base.windows?.appContainerMode ?? 'standard',
+      allowLoopback: windows?.allowLoopback ?? base.windows?.allowLoopback ?? false,
+    };
+  }
+
+  return result;
+}
+
+
 module.exports = {
   isRecord,
   expandHomePath,
@@ -371,4 +657,12 @@ module.exports = {
   formatLandstripTrap,
   formatLandstripTraps,
   controlResponseLine,
+  resolveFilesystemPatterns,
+  resolveFilesystemPolicy,
+  buildLandstripPolicy,
+  serializeLandstripPolicy,
+  mergeArray,
+  parseSandboxConfig,
+  deepMergeSandboxConfig,
+
 };

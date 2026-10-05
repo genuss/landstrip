@@ -142,6 +142,90 @@ export interface LandstripControlResponse {
   action: 'allow' | 'deny';
 }
 
+export interface LandstripFilesystemPolicy {
+  denyRead?: string[];
+  denyReadAlways?: string[];
+  allowRead?: string[];
+  allowWrite?: string[];
+  denyWrite?: string[];
+  denyWriteAlways?: string[];
+}
+
+export interface LandstripNetworkPolicy {
+  allowNetwork?: boolean;
+  allowLocalBinding?: boolean;
+  allowAllUnixSockets?: boolean;
+  allowUnixSockets?: string[];
+  httpProxyPort?: number;
+  socksProxyPort?: number;
+}
+
+export type LandstripWindowsAppContainerMode = 'lpac' | 'standard';
+
+export interface LandstripWindowsPolicy {
+  appContainerMode?: LandstripWindowsAppContainerMode;
+  allowLoopback?: boolean;
+}
+
+export interface LandstripPolicy {
+  filesystem?: LandstripFilesystemPolicy;
+  network?: LandstripNetworkPolicy;
+  windows?: LandstripWindowsPolicy;
+}
+
+export interface SandboxFilesystemConfig {
+  denyRead: string[];
+  denyReadAlways: string[];
+  allowRead: string[];
+  allowWrite: string[];
+  denyWrite: string[];
+  denyWriteAlways: string[];
+}
+
+export type ShellReadAccess = 'host' | 'policy';
+
+export interface SandboxShellConfig {
+  readAccess: ShellReadAccess;
+}
+
+export interface SandboxNetworkConfig {
+  allowNetwork: boolean;
+  allowLocalBinding: boolean;
+  allowAllUnixSockets: boolean;
+  allowUnixSockets: string[];
+  allowedDomains: string[];
+  deniedDomains: string[];
+}
+
+export interface SandboxWindowsConfig {
+  appContainerMode: LandstripWindowsAppContainerMode;
+  allowLoopback: boolean;
+}
+
+export interface SandboxConfig {
+  enabled: boolean;
+  shell?: SandboxShellConfig;
+  network: SandboxNetworkConfig;
+  filesystem: SandboxFilesystemConfig;
+  windows?: SandboxWindowsConfig;
+}
+
+export type SandboxFilesystemConfigFile = Partial<SandboxFilesystemConfig>;
+export type SandboxShellConfigFile = Partial<SandboxShellConfig>;
+export type SandboxNetworkConfigFile = Partial<SandboxNetworkConfig>;
+export type SandboxWindowsConfigFile = Partial<SandboxWindowsConfig>;
+
+export interface SandboxConfigFile {
+  enabled?: boolean;
+  shell?: SandboxShellConfigFile;
+  network?: SandboxNetworkConfigFile;
+  filesystem?: SandboxFilesystemConfigFile;
+  windows?: SandboxWindowsConfigFile;
+}
+
+export type SandboxConfigOverrides = SandboxConfigFile;
+
+
 /**
  * Path to the native landstrip binary for the running platform.
  *
