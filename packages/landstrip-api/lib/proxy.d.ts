@@ -20,3 +20,35 @@ export interface FilterProxyHandle {
 }
 
 export function startFilterProxy(options: FilterProxyOptions): Promise<FilterProxyHandle>;
+
+export const PROXY_ENVIRONMENT_VARIABLES: readonly [
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'all_proxy',
+];
+
+export type ProxyEnvironmentVariable = (typeof PROXY_ENVIRONMENT_VARIABLES)[number];
+
+export interface ProxyCredentials {
+  token: string;
+  authorization: string;
+}
+
+export function createProxyCredentials(token?: string): ProxyCredentials;
+
+export function createProxyUrl(port: number, token?: string | null, host?: string): string;
+
+export interface CreateProxyEnvironmentOptions {
+  token?: string | null;
+  host?: string;
+  baseEnv?: NodeJS.ProcessEnv;
+}
+
+export function createProxyEnvironment(
+  port?: number | null,
+  options?: CreateProxyEnvironmentOptions | string | null,
+  baseEnv?: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv;

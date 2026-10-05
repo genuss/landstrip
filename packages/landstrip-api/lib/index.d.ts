@@ -259,3 +259,13 @@ export function binaryPath(platform?: string, arch?: string): string;
 
 /** Name of the binary package for the given platform. */
 export function packageName(platform?: string, arch?: string): string;
+
+
+export type {
+  ProxyPortRange,
+  FilterProxyOptions,
+  FilterProxyHandle,
+  ProxyEnvironmentVariable,
+  ProxyCredentials,
+  CreateProxyEnvironmentOptions,
+} from './proxy';

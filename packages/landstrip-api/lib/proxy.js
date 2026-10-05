@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 'use strict';
 
+const { randomBytes } = require('node:crypto');
+
 const { lookup } = require('node:dns/promises');
 const { Agent, createServer: createHttpServer, request: requestHttp } = require('node:http');
 const { connect, isIP } = require('node:net');
@@ -342,6 +344,60 @@ function startFilterProxy(options) {
   });
 }
 
+const PROXY_ENVIRONMENT_VARIABLES = [
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'all_proxy',
+];
+
+function createProxyCredentials(tokenArg) {
+  const token =
+    typeof tokenArg === 'string' && tokenArg.length > 0
+      ? tokenArg
+      : randomBytes(32).toString('base64url');
+  const authorization = `Basic ${Buffer.from(`landstrip:${token}`).toString('base64')}`;
+  return { token, authorization };
+}
+
+function createProxyUrl(port, token, host = '127.0.0.1') {
+  const credentials = typeof token === 'string' && token.length > 0 ? `landstrip:${token}@` : '';
+  return `http://${credentials}${host}:${port}`;
+}
+
+function createProxyEnvironment(port, options, baseEnvArg) {
+  let token = null;
+  let host = '127.0.0.1';
+  let baseEnv = baseEnvArg;
+
+  if (typeof options === 'string') {
+    token = options;
+  } else if (options && typeof options === 'object') {
+    if (typeof options.token === 'string') token = options.token;
+    if (typeof options.host === 'string') host = options.host;
+    if (options.baseEnv && typeof options.baseEnv === 'object') baseEnv = options.baseEnv;
+  }
+
+  const result = baseEnv ? { ...baseEnv } : {};
+  if (!port || typeof port !== 'number' || port <= 0) {
+    return result;
+  }
+
+  const url = createProxyUrl(port, token, host);
+  for (const name of PROXY_ENVIRONMENT_VARIABLES) {
+    result[name] = url;
+  }
+  result.NO_PROXY = '';
+  result.no_proxy = '';
+  return result;
+}
+
 module.exports = {
   startFilterProxy,
+  PROXY_ENVIRONMENT_VARIABLES,
+  createProxyCredentials,
+  createProxyUrl,
+  createProxyEnvironment,
 };
