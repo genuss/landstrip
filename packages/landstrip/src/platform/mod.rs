@@ -52,7 +52,7 @@ pub(crate) fn validate(_policy: &crate::policy::AccessPolicy) -> anyhow::Result<
 #[cfg(target_os = "macos")]
 pub(crate) fn validate(policy: &crate::policy::AccessPolicy) -> anyhow::Result<()> {
     policy.validate()?;
-    Ok(())
+    macos::validate_write_patterns(policy)
 }
 
 #[cfg(target_os = "windows")]

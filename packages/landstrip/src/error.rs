@@ -80,6 +80,8 @@ pub(crate) enum Error {
     PolicyUnixSocketPath,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     PolicyDenyWriteSymlinkAncestor,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    PolicyWriteGlobUnsupported,
     PolicyInvalidPort,
     PolicyEmptyPath,
     PolicyHomeUnavailable,
@@ -179,6 +181,9 @@ impl Error {
             Self::PolicyDenyWriteSymlinkAncestor => {
                 Some("a denied write symlink ancestor is reachable through an allowed write root")
             }
+            Self::PolicyWriteGlobUnsupported => Some(
+                "macOS write-allow globs require control-free paths and nonempty ASCII character classes",
+            ),
             Self::PolicyInvalidPort => Some("proxy ports must be between 1 and 65535"),
             Self::PolicyEmptyPath => Some("policy paths must not be empty"),
             Self::PolicyHomeUnavailable => {

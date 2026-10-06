@@ -168,6 +168,45 @@ match future entries.
 .Pp
 Linux and macOS enforce concrete and glob write denials at access time.
 Windows enforces only concrete paths that exist at startup, not globs.
+.Pp
+On macOS,
+.Va allowWrite
+globs are native Seatbelt rules, not filesystem scans.
+They permit matching paths and their descendants, including matches created
+after sandbox startup.
+For example,
+.Sq ~/IdeaProjects/**/.git
+permits Git metadata without granting other project working files.
+Nonmatching parent directories remain unwritable unless separately granted.
+Read globs, Unix socket globs, and write-allow globs on other platforms still
+expand existing paths at startup.
+.Pp
+The literal directory prefix before the first wildcard also receives a
+canonical-path alias; that prefix remains literal even if its resolved name
+contains glob characters.
+Symlinks in the wildcard portion do not grant out-of-pattern targets:
+those targets need separate permissions.
+MacOS write-allow globs support literal characters,
+.Sq * ,
+.Sq ** ,
+.Sq ? ,
+and ASCII literal/range character classes.
+Class characters
+.Sq ^
+and
+.Sq !
+are literal, not negation operators.
+Patterns containing control characters, non-ASCII classes, or classes that
+match no filename bytes are rejected before launch.
+.Va denyWrite
+still takes precedence over native write grants.
+.Cm policy resolve
+reports macOS write-allow patterns as literal
+.Va prefix
+and relative
+.Va glob
+pairs in
+.Va writeAllowedPatterns .
 .Ss Network
 Direct TCP connections are denied by default.
 On Linux and macOS, proxy ports permit host-local TCP connections but do not
@@ -224,6 +263,9 @@ operations.
 System V semaphore operations are permitted for database locking such as LMDB.
 This allowance is subject to OS permissions, is not scoped to filesystem grants,
 and does not permit other System V IPC operations.
+POSIX named semaphore operations are also permitted for Python multiprocessing
+and similar users, subject to OS permissions rather than filesystem grants.
+This does not grant POSIX shared-memory access.
 Mach lookup of com.apple.FSEvents is permitted for filesystem watchers;
 filesystem read/write grants remain unchanged.
 Mach lookup of com.apple.pasteboard.1 permits native clipboard access for the

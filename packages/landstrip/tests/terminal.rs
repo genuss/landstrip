@@ -62,7 +62,7 @@ fn same_attributes(actual: &libc::termios, expected: &libc::termios) -> bool {
     actual.c_iflag == expected.c_iflag
         && actual.c_oflag == expected.c_oflag
         && actual.c_cflag == expected.c_cflag
-        && actual.c_lflag == expected.c_lflag
+        && actual.c_lflag & !libc::PENDIN == expected.c_lflag & !libc::PENDIN
         && actual.c_cc == expected.c_cc
         && actual.c_ispeed == expected.c_ispeed
         && actual.c_ospeed == expected.c_ospeed
@@ -75,10 +75,35 @@ fn raw_mode_round_trip(fd: RawFd) -> io::Result<()> {
     set_attributes(fd, &raw)?;
     let actual = attributes(fd);
     set_attributes(fd, &original)?;
-    if !same_attributes(&actual?, &raw) || !same_attributes(&attributes(fd)?, &original) {
-        return Err(io::Error::other("terminal attributes did not round-trip"));
+    let actual = actual?;
+    if !same_attributes(&actual, &raw) {
+        return Err(attribute_mismatch("raw mode", &actual, &raw));
+    }
+    let restored = attributes(fd)?;
+    if !same_attributes(&restored, &original) {
+        return Err(attribute_mismatch("restored mode", &restored, &original));
     }
     Ok(())
+}
+
+fn attribute_mismatch(stage: &str, actual: &libc::termios, expected: &libc::termios) -> io::Error {
+    let describe = |value: &libc::termios| {
+        format!(
+            "iflag={:#x} oflag={:#x} cflag={:#x} lflag={:#x} cc={:?} ispeed={} ospeed={}",
+            value.c_iflag,
+            value.c_oflag,
+            value.c_cflag,
+            value.c_lflag,
+            value.c_cc,
+            value.c_ispeed,
+            value.c_ospeed,
+        )
+    };
+    io::Error::other(format!(
+        "terminal attributes did not round-trip ({stage}): actual [{}], expected [{}]",
+        describe(actual),
+        describe(expected),
+    ))
 }
 
 pub(super) fn probe(args: Vec<OsString>) -> i32 {

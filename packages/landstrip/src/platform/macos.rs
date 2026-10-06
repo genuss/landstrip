@@ -5,7 +5,9 @@
 
 use super::unix::close_inherited_fds;
 use crate::error::{Error, Mechanism};
-use crate::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
+use crate::policy::{
+    AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess, WriteAllowPattern, byte_in_class,
+};
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -100,10 +102,7 @@ fn terminal_path(fd: RawFd) -> io::Result<Option<String>> {
     }
 }
 
-fn render_profile(
-    policy: &AccessPolicy,
-    terminals: &[String],
-) -> std::result::Result<String, fmt::Error> {
+fn render_profile(policy: &AccessPolicy, terminals: &[String]) -> Result<String> {
     let mut sb = String::new();
     writeln!(sb, "(version 1)")?;
     writeln!(sb, "(deny default)")?;
@@ -111,10 +110,12 @@ fn render_profile(
     render_process_rules(&mut sb)?;
     render_mach_rules(&mut sb)?;
     writeln!(sb, "(allow ipc-sysv-sem)")?;
+    writeln!(sb, "(allow ipc-posix-sem)")?;
     render_terminal_rules(&mut sb, terminals)?;
     render_write_rules(
         &mut sb,
         &policy.write_roots,
+        &policy.write_allowed_patterns,
         &policy.write_denied_roots,
         &policy.write_denied_patterns,
     )?;
@@ -243,15 +244,108 @@ fn glob_to_sbpl_regex(pattern: &str) -> String {
     regex
 }
 
+pub(super) fn validate_write_patterns(policy: &AccessPolicy) -> Result<()> {
+    for pattern in &policy.write_allowed_patterns {
+        write_allow_regex(pattern)?;
+    }
+    Ok(())
+}
+
+fn write_allow_regex(pattern: &WriteAllowPattern) -> Result<String, Error> {
+    let prefix = pattern
+        .prefix
+        .to_str()
+        .ok_or(Error::PolicyWriteGlobUnsupported)?;
+    if prefix
+        .chars()
+        .chain(pattern.glob.chars())
+        .any(char::is_control)
+    {
+        return Err(Error::PolicyWriteGlobUnsupported);
+    }
+
+    let mut regex = String::from("^");
+    for ch in prefix.chars() {
+        push_regex_char(&mut regex, ch);
+    }
+    if !prefix.ends_with('/') {
+        regex.push('/');
+    }
+    let mut rest = pattern.glob.as_str();
+    while !rest.is_empty() {
+        if let Some(tail) = rest.strip_prefix("**/") {
+            regex.push_str("(.*/)?");
+            rest = tail;
+        } else if let Some(tail) = rest.strip_prefix("**") {
+            regex.push_str(".*");
+            rest = tail;
+        } else if let Some(tail) = rest.strip_prefix('*') {
+            regex.push_str("[^/]*");
+            rest = tail;
+        } else if let Some(tail) = rest.strip_prefix('?') {
+            regex.push_str("[^/]");
+            rest = tail;
+        } else if let Some(tail) = rest.strip_prefix('[')
+            && let Some(end) = tail.find(']')
+        {
+            regex.push_str(&write_allow_class(&tail[..end])?);
+            rest = &tail[end + 1..];
+        } else {
+            let mut chars = rest.chars();
+            if let Some(ch) = chars.next() {
+                push_regex_char(&mut regex, ch);
+            }
+            rest = chars.as_str();
+        }
+    }
+    regex.push_str("(/.*)?$");
+    Ok(regex)
+}
+
+fn write_allow_class(class: &str) -> Result<String, Error> {
+    if !class.is_ascii() {
+        return Err(Error::PolicyWriteGlobUnsupported);
+    }
+    let mut alternatives = Vec::new();
+    for byte in 1..=127 {
+        if byte != b'/' && byte_in_class(byte, class.as_bytes()) {
+            let mut literal = String::new();
+            push_regex_char(&mut literal, char::from(byte));
+            alternatives.push(literal);
+        }
+    }
+    if alternatives.is_empty() {
+        return Err(Error::PolicyWriteGlobUnsupported);
+    }
+    Ok(format!("({})", alternatives.join("|")))
+}
+
+fn push_regex_char(regex: &mut String, ch: char) {
+    if matches!(
+        ch,
+        '.' | '(' | ')' | '{' | '}' | '+' | '|' | '^' | '$' | '\\' | '[' | ']' | '*' | '?'
+    ) {
+        regex.push('\\');
+    }
+    regex.push(ch);
+}
+
 fn render_write_rules(
     sb: &mut String,
     write_roots: &[PathBuf],
+    write_allowed_patterns: &[WriteAllowPattern],
     write_denied_roots: &[PathBuf],
     write_denied_patterns: &[String],
-) -> fmt::Result {
+) -> Result<()> {
     for root in write_roots {
         let escaped = escape_sbpl_literal(&root.to_string_lossy());
         writeln!(sb, "(allow file-write* (subpath \"{escaped}\"))")?;
+    }
+
+    for pattern in write_allowed_patterns {
+        let regex = write_allow_regex(pattern)?;
+        let escaped = escape_sbpl_literal(&regex);
+        writeln!(sb, "(allow file-write* (regex \"{escaped}\"))")?;
     }
 
     // Deny rules follow the allow rules so SBPL's last-match-wins precedence
@@ -265,8 +359,8 @@ fn render_write_rules(
     // they also cover paths created after sandbox_init.
     for pattern in write_denied_patterns {
         let regex = glob_to_sbpl_regex(pattern);
-        let escaped = escape_sbpl_regex_literal(&regex);
-        writeln!(sb, "(deny file-write* (regex #\"{escaped}\"))")?;
+        let escaped = escape_sbpl_literal(&regex);
+        writeln!(sb, "(deny file-write* (regex \"{escaped}\"))")?;
     }
 
     Ok(())
@@ -421,18 +515,6 @@ fn escape_sbpl_literal(path: &str) -> String {
     escaped
 }
 
-fn escape_sbpl_regex_literal(regex: &str) -> String {
-    let mut escaped = String::with_capacity(regex.len());
-    for ch in regex.chars() {
-        match ch {
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
 fn take_sandbox_error(errorbuf: *mut libc::c_char) -> String {
     if errorbuf.is_null() {
         return "sandbox_init failed without an error message".to_string();
@@ -443,6 +525,112 @@ fn take_sandbox_error(errorbuf: *mut libc::c_char) -> String {
         .into_owned();
     unsafe { ffi::sandbox_free_error(errorbuf) };
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pattern(prefix: &str, glob: &str) -> WriteAllowPattern {
+        WriteAllowPattern {
+            prefix: PathBuf::from(prefix),
+            glob: glob.to_owned(),
+        }
+    }
+
+    #[test]
+    fn write_allow_regex_anchors_roots_and_descendants() -> Result<()> {
+        assert_eq!(
+            write_allow_regex(&pattern("/projects", "**/.git"))?,
+            r"^/projects/(.*/)?\.git(/.*)?$"
+        );
+        assert_eq!(
+            write_allow_regex(&pattern("/", "repo*/match?"))?,
+            r"^/repo[^/]*/match[^/](/.*)?$"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_allow_regex_quotes_literal_prefixes_and_glob_literals() -> Result<()> {
+        assert_eq!(
+            write_allow_regex(&pattern(r"/repo[1]*?", r#"**/a(b)+{c}$^|d\e"f]"#))?,
+            r#"^/repo\[1\]\*\?/(.*/)?a\(b\)\+\{c\}\$\^\|d\\e"f\](/.*)?$"#
+        );
+        assert_eq!(
+            write_allow_regex(&pattern("/projects", "release["))?,
+            r"^/projects/release\[(/.*)?$"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_allow_classes_use_glob_not_regex_semantics() -> Result<()> {
+        assert_eq!(write_allow_class("0-2")?, "(0|1|2)");
+        assert_eq!(write_allow_class("^a")?, r"(\^|a)");
+        assert_eq!(write_allow_class("!a")?, "(!|a)");
+        assert_eq!(write_allow_class("-")?, "(-)");
+        assert_eq!(write_allow_class(".0")?, "(\\.|0)");
+        assert!(write_allow_class("").is_err());
+        assert!(write_allow_class("z-a").is_err());
+        assert!(write_allow_class("é").is_err());
+        assert!(write_allow_regex(&pattern("/projects", "*\n")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_compiler_accepts_escaped_write_rules() -> Result<()> {
+        for glob in [
+            "**/.git",
+            r#"**/repo"quoted"#,
+            r"**/repo\backslash",
+            r#"**/repo") (allow default) ("#,
+            "**/repo[-]",
+            r"**/repo[\]",
+            "**/repo[.]",
+        ] {
+            let mut profile = String::from("(version 1)\n(deny default)\n");
+            render_write_rules(
+                &mut profile,
+                &[],
+                &[pattern("/projects", glob)],
+                &[],
+                &[r#"/projects/**/private"quoted\file"#.to_owned()],
+            )?;
+            let profile = CString::new(profile)?;
+            let mut error = ptr::null_mut();
+            let compiled = unsafe {
+                ffi::sandbox_compile_string(profile.as_ptr(), ptr::null_mut(), &raw mut error)
+            };
+            if compiled.is_null() {
+                return Err(seatbelt_error(take_sandbox_error(error)));
+            }
+            unsafe { ffi::sandbox_free_profile(compiled) };
+            if !error.is_null() {
+                unsafe { ffi::sandbox_free_error(error) };
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn write_denials_follow_both_kinds_of_grants() -> Result<()> {
+        let mut profile = String::new();
+        render_write_rules(
+            &mut profile,
+            &[PathBuf::from("/concrete")],
+            &[pattern("/projects", "**/.git")],
+            &[PathBuf::from("/projects/private")],
+            &["/projects/**/.env".to_owned()],
+        )?;
+        let lines: Vec<_> = profile.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].starts_with("(allow file-write* (subpath"));
+        assert!(lines[1].starts_with("(allow file-write* (regex"));
+        assert!(lines[2].starts_with("(deny file-write* (subpath"));
+        assert!(lines[3].starts_with("(deny file-write* (regex"));
+        Ok(())
+    }
 }
 
 mod ffi {
@@ -456,6 +644,14 @@ mod ffi {
             errorbuf: *mut *mut c_char,
         ) -> c_int;
         pub(super) fn sandbox_free_error(errorbuf: *mut c_char);
+        #[cfg(test)]
+        pub(super) fn sandbox_compile_string(
+            profile: *const c_char,
+            parameters: *mut libc::c_void,
+            errorbuf: *mut *mut c_char,
+        ) -> *mut libc::c_void;
+        #[cfg(test)]
+        pub(super) fn sandbox_free_profile(profile: *mut libc::c_void);
         pub(super) fn sandbox_check(
             pid: libc::pid_t,
             operation: *const c_char,

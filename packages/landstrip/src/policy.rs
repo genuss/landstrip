@@ -12,8 +12,7 @@
 //! stay denied even when the destination is under `allowWrite`.
 //!
 //! Paths accept absolute names, names relative to the policy base, `~`, and the
-//! macOS-style `*`, `**`, `?`, and character-class globs. Globs are expanded
-//! while lowering the policy.
+//! macOS-style `*`, `**`, `?`, and character-class globs.
 
 use crate::config::{AppContainerMode, SandboxFilesystem, SandboxNetwork, SandboxWindows};
 use crate::error::{Error, PathIo};
@@ -31,6 +30,8 @@ use std::path::{Path, PathBuf};
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AccessPolicy {
     pub(crate) write_roots: Vec<PathBuf>,
+    #[cfg(target_os = "macos")]
+    pub(crate) write_allowed_patterns: Vec<WriteAllowPattern>,
     pub(crate) write_denied_roots: Vec<PathBuf>,
     pub(crate) write_denied_always_roots: Box<[PathBuf]>,
     pub(crate) write_denied_patterns: Vec<String>,
@@ -45,6 +46,25 @@ pub(crate) struct AccessPolicy {
     pub(crate) app_container_mode: AppContainerMode,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) allow_windows_loopback: bool,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub(crate) struct WriteAllowPattern {
+    pub(crate) prefix: PathBuf,
+    pub(crate) glob: String,
+}
+
+#[cfg(target_os = "macos")]
+impl WriteAllowPattern {
+    fn covers(&self, path: &Path) -> bool {
+        path.strip_prefix(&self.prefix).is_ok_and(|relative| {
+            relative
+                .ancestors()
+                .filter(|ancestor| !ancestor.as_os_str().is_empty())
+                .any(|ancestor| path_matches_glob_str(ancestor, &self.glob))
+        })
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -127,10 +147,13 @@ impl AccessPolicy {
             }
         }
 
-        let has_writable_symlink_ancestor = self
-            .write_denied_links
-            .iter()
-            .any(|link| link.is_under_any(&self.write_roots));
+        let has_writable_symlink_ancestor = self.write_denied_links.iter().any(|link| {
+            link.is_under_any(&self.write_roots)
+                || self
+                    .write_allowed_patterns
+                    .iter()
+                    .any(|pattern| pattern.covers(link))
+        });
         if has_writable_symlink_ancestor {
             return Err(Error::PolicyDenyWriteSymlinkAncestor);
         }
@@ -307,6 +330,10 @@ pub(crate) fn resolve_policy(
     };
     let policy_base = normalize_path_lexically(&policy_base);
 
+    #[cfg(target_os = "macos")]
+    let (write_allow, write_allowed_patterns) =
+        resolve_write_allow(&filesystem.allow_write, &policy_base, home)?;
+    #[cfg(not(target_os = "macos"))]
     let write_allow = resolve_paths(&filesystem.allow_write, &policy_base, home)?;
     // Missing Windows allow roots cannot receive ACL entries. Dropping them is
     // fail-closed because sandbox SIDs receive no access to those paths.
@@ -320,7 +347,7 @@ pub(crate) fn resolve_policy(
     let mut write_denied_links =
         collect_symlink_ancestors(&filesystem.deny_write, &policy_base, home)?;
     let write_denied_always_roots =
-        resolve_paths(&filesystem.deny_write_always, &policy_base, home)?;
+        resolve_write_denied_always(&filesystem.deny_write_always, &policy_base, home)?;
     let write_allow: Vec<_> = write_allow
         .into_iter()
         .filter(|path| !path.is_under_any(&write_denied_always_roots))
@@ -363,6 +390,8 @@ pub(crate) fn resolve_policy(
     normalize_roots(&mut read_denied_roots);
     let policy = AccessPolicy {
         write_roots: write_allow,
+        #[cfg(target_os = "macos")]
+        write_allowed_patterns,
         write_denied_roots: write_deny,
         write_denied_always_roots: write_denied_always_roots.into_boxed_slice(),
         write_denied_patterns,
@@ -586,6 +615,72 @@ fn resolve_paths(
     Ok(resolved)
 }
 
+fn resolve_write_denied_always(
+    paths: &[String],
+    policy_base: &Path,
+    home: Option<&Path>,
+) -> Result<Vec<PathBuf>> {
+    let roots = resolve_paths(paths, policy_base, home)?;
+    #[cfg(target_os = "macos")]
+    let roots = {
+        let aliases: Vec<_> = roots
+            .iter()
+            .filter_map(|root| canonicalize_existing_prefix(root))
+            .collect();
+        let mut roots = roots;
+        roots.extend(aliases);
+        normalize_roots(&mut roots);
+        roots
+    };
+    Ok(roots)
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_write_allow(
+    paths: &[String],
+    policy_base: &Path,
+    home: Option<&Path>,
+) -> Result<(Vec<PathBuf>, Vec<WriteAllowPattern>)> {
+    let mut roots = Vec::new();
+    let mut patterns = Vec::new();
+
+    for path in paths {
+        let resolved = resolve_sandbox_path(path, policy_base, home)?;
+        let text = resolved.to_string_lossy();
+        if text.bytes().any(is_glob_byte) {
+            let prefix = glob_base(&text);
+            let glob = resolved
+                .strip_prefix(&prefix)?
+                .to_string_lossy()
+                .into_owned();
+            if let Some(canonical) = canonicalize_existing_prefix(&prefix) {
+                patterns.push(WriteAllowPattern {
+                    prefix: canonical,
+                    glob: glob.clone(),
+                });
+            }
+            patterns.push(WriteAllowPattern { prefix, glob });
+        } else {
+            push_path_variants(&mut roots, &resolved);
+        }
+    }
+
+    normalize_roots(&mut roots);
+    patterns.sort_unstable();
+    patterns.dedup();
+    Ok((roots, patterns))
+}
+
+#[cfg(target_os = "macos")]
+fn canonicalize_existing_prefix(prefix: &Path) -> Option<PathBuf> {
+    prefix.ancestors().find_map(|ancestor| {
+        let canonical = fs::canonicalize(ancestor).ok()?;
+        Some(normalize_path_lexically(
+            &canonical.join(prefix.strip_prefix(ancestor).ok()?),
+        ))
+    })
+}
+
 fn resolve_deny_paths(
     paths: &[String],
     policy_base: &Path,
@@ -602,7 +697,7 @@ fn resolve_deny_paths(
             #[cfg(target_os = "macos")]
             {
                 let base = glob_base(&resolved_str);
-                if let Ok(canonical) = fs::canonicalize(&base) {
+                if let Some(canonical) = canonicalize_existing_prefix(&base) {
                     let base_str = base.to_string_lossy();
                     let canonical_str = canonical.to_string_lossy();
                     if canonical_str != base_str
@@ -615,7 +710,11 @@ fn resolve_deny_paths(
                 }
             }
         } else {
-            push_path_variants(&mut concrete, &resolved);
+            concrete.push(normalize_path(&resolved));
+            #[cfg(target_os = "macos")]
+            if let Some(canonical) = canonicalize_existing_prefix(&resolved) {
+                concrete.push(canonical);
+            }
         }
     }
 
@@ -1006,7 +1105,163 @@ fn class_matches(
         && glob_matches_at(pattern, text, class_end + 1, text_at + 1, memo)
 }
 
-fn byte_in_class(byte: u8, class: &[u8]) -> bool {
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_allow_patterns_resolve_home_and_relative_paths() -> Result<()> {
+        let (roots, patterns) = resolve_write_allow(
+            &[
+                "~/IdeaProjects/**/.git".to_owned(),
+                "work/*".to_owned(),
+                ".".to_owned(),
+            ],
+            Path::new("/landstrip-unit-workspace"),
+            Some(Path::new("/landstrip-unit-home")),
+        )?;
+        assert_eq!(roots, vec![PathBuf::from("/landstrip-unit-workspace")]);
+        assert_eq!(
+            patterns,
+            vec![
+                WriteAllowPattern {
+                    prefix: PathBuf::from("/landstrip-unit-home/IdeaProjects"),
+                    glob: "**/.git".to_owned(),
+                },
+                WriteAllowPattern {
+                    prefix: PathBuf::from("/landstrip-unit-workspace/work"),
+                    glob: "*".to_owned(),
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_allow_patterns_keep_canonical_prefixes_literal() -> Result<()> {
+        let (roots, patterns) = resolve_write_allow(
+            &["/tmp/landstrip-unit-missing/**/.git".to_owned()],
+            Path::new("/"),
+            None,
+        )?;
+        assert!(roots.is_empty());
+        let canonical = fs::canonicalize("/tmp")?.join("landstrip-unit-missing");
+        assert!(patterns.iter().any(|pattern| pattern.prefix == canonical));
+        assert!(patterns.iter().all(|pattern| pattern.glob == "**/.git"));
+        Ok(())
+    }
+
+    #[test]
+    fn write_denials_preserve_canonical_aliases_for_future_paths() -> Result<()> {
+        let missing = "landstrip-unit-future-denial/main/.git";
+        let base = Path::new("/tmp").join(missing);
+        let canonical = fs::canonicalize("/tmp")?.join(missing);
+        let (roots, patterns) = resolve_deny_paths(
+            &[
+                base.join("config").to_string_lossy().into_owned(),
+                base.join("private/*.pem").to_string_lossy().into_owned(),
+            ],
+            Path::new("/"),
+            None,
+        )?;
+        assert!(roots.contains(&canonical.join("config")), "{roots:?}");
+        assert!(
+            patterns.contains(
+                &canonical
+                    .join("private/*.pem")
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "{patterns:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_write_globs_preserve_future_hard_denial_aliases() -> Result<()> {
+        let missing = "landstrip-unit-future-hard-denial/main/.git/config";
+        let canonical = fs::canonicalize("/tmp")?.join(missing);
+        let policy = resolve_policy(
+            &SandboxFilesystem {
+                allow_write: vec!["/tmp/landstrip-unit-future-hard-denial/**/.git".to_owned()],
+                deny_write_always: vec![format!("/tmp/{missing}")],
+                ..SandboxFilesystem::default()
+            },
+            &SandboxNetwork::default(),
+            &SandboxWindows::default(),
+            Path::new("/"),
+        )?;
+        assert!(
+            policy.write_denied_always_roots.contains(&canonical),
+            "{:?}",
+            policy.write_denied_always_roots
+        );
+        assert!(policy.write_denied_roots.contains(&canonical));
+        Ok(())
+    }
+
+    #[test]
+    fn write_deny_globs_preserve_existing_prefix_boundaries() -> Result<()> {
+        let (_, patterns) = resolve_deny_paths(&["/tmp/**/.env".to_owned()], Path::new("/"), None)?;
+        let canonical = fs::canonicalize("/tmp")?;
+        assert!(
+            patterns.contains(&format!("{}/**/.env", canonical.display())),
+            "{patterns:?}"
+        );
+        assert!(patterns.iter().all(|pattern| !pattern.contains("//")));
+        Ok(())
+    }
+
+    #[test]
+    fn write_allow_pattern_coverage_respects_path_boundaries() {
+        let pattern = WriteAllowPattern {
+            prefix: PathBuf::from("/repo[1]"),
+            glob: "**/.git".to_owned(),
+        };
+        for path in ["/repo[1]/.git", "/repo[1]/team/main/.git/index"] {
+            assert!(pattern.covers(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/repo[1]",
+            "/repo1/.git",
+            "/repo[1]/.github",
+            "/repo[1]/main/.git-backup/index",
+            "/repo[1]/main/source.rs",
+        ] {
+            assert!(!pattern.covers(Path::new(path)), "{path}");
+        }
+        let star = WriteAllowPattern {
+            prefix: pattern.prefix,
+            glob: "*".to_owned(),
+        };
+        assert!(!star.covers(Path::new("/repo[1]")));
+    }
+
+    #[test]
+    fn resolved_policy_serializes_native_write_patterns() -> Result<()> {
+        let policy = resolve_policy(
+            &SandboxFilesystem {
+                allow_write: vec!["/landstrip-unit-projects/**/.git".to_owned()],
+                ..SandboxFilesystem::default()
+            },
+            &SandboxNetwork::default(),
+            &SandboxWindows::default(),
+            Path::new("/"),
+        )?;
+        let value = serde_json::to_value(policy)?;
+        assert_eq!(value["writeRoots"], serde_json::json!([]));
+        assert_eq!(
+            value["writeAllowedPatterns"],
+            serde_json::json!([{
+                "prefix": "/landstrip-unit-projects",
+                "glob": "**/.git",
+            }])
+        );
+        Ok(())
+    }
+}
+
+pub(crate) fn byte_in_class(byte: u8, class: &[u8]) -> bool {
     let mut at = 0;
 
     while at < class.len() {

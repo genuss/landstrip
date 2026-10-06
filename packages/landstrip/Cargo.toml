@@ -17,6 +17,10 @@ name = "data"
 path = "tests/data.rs"
 harness = false
 
+[[test]]
+name = "native_write_globs"
+path = "tests/native_write_globs.rs"
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
